@@ -98,6 +98,7 @@ body{
   -webkit-font-smoothing:antialiased;
   overflow-x:hidden;
   transition: background .25s ease, color .25s ease;
+  direction:ltr; /* explicit — guards against an OS/browser-level forced-RTL override flipping the layout even though html already sets dir="ltr" */
 }
 .urdu{ font-family: var(--font-ur); direction:rtl; }
 ::-webkit-scrollbar{width:8px; height:8px;}
@@ -110,7 +111,7 @@ a{text-decoration:none; color:inherit;}
 /* ============================================================
    APP SHELL
    ============================================================ */
-.app{ display:flex; min-height:100vh; }
+.app{ display:flex; flex-direction:row; direction:ltr; min-height:100vh; }
 
 /* -------- SIDEBAR -------- */
 .sidebar{
@@ -121,6 +122,7 @@ a{text-decoration:none; color:inherit;}
   display:flex; flex-direction:column;
   transition: width .25s ease;
   z-index:40;
+  order:0;
 }
 .sidebar.collapsed{ width:var(--sidebar-w-collapsed); }
 .sidebar-brand{
@@ -218,7 +220,7 @@ input:checked + .slider:before{ transform:translateX(17px); }
 }
 
 /* -------- MAIN -------- */
-.main{ flex:1; min-width:0; display:flex; flex-direction:column; }
+.main{ flex:1; min-width:0; display:flex; flex-direction:column; order:1; }
 
 /* HEADER */
 .header{
@@ -4355,7 +4357,67 @@ function renderTableRow(r){
   return tr;
 }
 
-function getTableRows(){
+// ---- Table sort worker (Phase 6) ----
+// Sorting millions of rows with Array.prototype.sort() blocks the main thread for the
+// whole duration — a real freeze risk on a genuinely large table. Only the sort-key
+// values (not full row objects) are sent to the worker, kept small even at huge row
+// counts; the worker returns the sort ORDER (indices), which the main thread applies
+// to its own rows array with a cheap re-index (no data duplication, no big transfer back).
+const SORT_WORKER_CODE = `
+self.onmessage = function(e){
+  const { requestId, values, dir, kind } = e.data;
+  const idx = new Array(values.length);
+  for(let i=0;i<values.length;i++) idx[i]=i;
+  if(kind==='amount'){
+    idx.sort((a,b)=> values[a] > values[b] ? dir : -dir);
+  } else {
+    idx.sort((a,b)=> values[a].localeCompare(values[b]) * dir);
+  }
+  self.postMessage({requestId, order: idx});
+};
+`;
+let _sortWorker = null, _sortWorkerReqId = 0;
+const _sortWorkerPending = new Map();
+function getSortWorker(){
+  if(_sortWorker) return _sortWorker;
+  try{
+    const blob = new Blob([SORT_WORKER_CODE], {type:'application/javascript'});
+    _sortWorker = new Worker(URL.createObjectURL(blob));
+    _sortWorker.onmessage = (e)=>{
+      const { requestId, order } = e.data;
+      const resolve = _sortWorkerPending.get(requestId);
+      if(resolve){ resolve(order); _sortWorkerPending.delete(requestId); }
+    };
+    _sortWorker.onerror = ()=>{ _sortWorker = null; }; // fall back to local sort on next call
+  }catch(err){ _sortWorker = null; }
+  return _sortWorker;
+}
+const SORT_WORKER_ROW_THRESHOLD = 50000; // below this, a worker round-trip costs more than it saves
+function localSortOrder(values, dir, kind){
+  const idx = values.map((v,i)=>i);
+  if(kind==='amount') idx.sort((a,b)=> values[a] > values[b] ? dir : -dir);
+  else idx.sort((a,b)=> values[a].localeCompare(values[b]) * dir);
+  return idx;
+}
+async function getSortOrder(values, dir, kind){
+  if(values.length < SORT_WORKER_ROW_THRESHOLD) return localSortOrder(values, dir, kind);
+  const worker = getSortWorker();
+  if(!worker) return localSortOrder(values, dir, kind); // worker unavailable — same safe fallback pattern as import
+  const requestId = ++_sortWorkerReqId;
+  return new Promise(resolve=>{
+    const timeoutId = setTimeout(()=>{ // worker stuck/unavailable — don't hang the table forever
+      if(_sortWorkerPending.has(requestId)){ _sortWorkerPending.delete(requestId); resolve(localSortOrder(values, dir, kind)); }
+    }, 8000);
+    _sortWorkerPending.set(requestId, (order)=>{ clearTimeout(timeoutId); resolve(order); });
+    worker.postMessage({requestId, values, dir, kind});
+  });
+}
+
+let _tableRowsCacheKey = null, _tableRowsCacheResult = null;
+async function getTableRows(){
+  const key = dataGeneration+'|'+JSON.stringify(state.filterSel)+'|'+(state.active===state.rows?'base':state.active.length)+'|'+state.table.search+'|'+state.table.sortKey+'|'+state.table.sortDir;
+  if(_tableRowsCacheKey===key && _tableRowsCacheResult){ return _tableRowsCacheResult; }
+
   let rows = state.active.slice();
   const s = state.table.search.toLowerCase();
   if(s){
@@ -4363,20 +4425,19 @@ function getTableRows(){
   }
   if(state.table.sortKey){
     const k = state.table.sortKey, dir = state.table.sortDir;
-    rows.sort((a,b)=>{
-      let av = a[k], bv = b[k];
-      const an = parseFloat(av), bn = parseFloat(bv);
-      if(!isNaN(an) && !isNaN(bn) && String(an)===String(av).trim() ) {} // fallthrough to generic compare below
-      if(k===COL.AMOUNT){ return (parseFloat(av)||0) > (parseFloat(bv)||0) ? dir : -dir; }
-      av = String(av||''); bv = String(bv||'');
-      return av.localeCompare(bv) * dir;
-    });
+    const kind = (k===COL.AMOUNT) ? 'amount' : 'string';
+    const values = kind==='amount' ? rows.map(r=>parseFloat(r[k])||0) : rows.map(r=>String(r[k]||''));
+    const order = await getSortOrder(values, dir, kind);
+    rows = order.map(i=>rows[i]);
   }
+  // NOTE: filter/data can change while a sort was in flight — re-check identity before caching
+  const freshKey = dataGeneration+'|'+JSON.stringify(state.filterSel)+'|'+(state.active===state.rows?'base':state.active.length)+'|'+state.table.search+'|'+state.table.sortKey+'|'+state.table.sortDir;
+  if(freshKey===key){ _tableRowsCacheKey = key; _tableRowsCacheResult = rows; }
   return rows;
 }
 
 const VIRTUAL_ROW_HEIGHT = 43; // approx rendered row height in px, used to compute the scroll window
-function buildTable(){
+async function buildTable(){
   const tbody = document.getElementById('tableBody');
   const footerSpan = document.getElementById('tableFooterText');
   const pager = document.getElementById('tablePager');
@@ -4390,7 +4451,7 @@ function buildTable(){
     return;
   }
 
-  const filtered = getTableRows();
+  const filtered = await getTableRows();
 
   document.getElementById('virtualScrollBtn').classList.toggle('active', !!state.table.virtualMode);
   wrap.classList.toggle('virtual-mode', !!state.table.virtualMode);
@@ -4550,8 +4611,8 @@ document.getElementById('tableHeadRow').addEventListener('click', (e)=>{
   else { state.table.sortKey = key; state.table.sortDir = 1; }
   buildTable();
 });
-document.getElementById('tableExportBtn').addEventListener('click', ()=> exportToExcel(getTableRows(), 'Collection_Export'));
-document.getElementById('tableCsvBtn').addEventListener('click', ()=> exportToCSV(getTableRows(), 'Collection_Export'));
+document.getElementById('tableExportBtn').addEventListener('click', async ()=> exportToExcel(await getTableRows(), 'Collection_Export'));
+document.getElementById('tableCsvBtn').addEventListener('click', async ()=> exportToCSV(await getTableRows(), 'Collection_Export'));
 
 /* Rows per page */
 document.getElementById('rowsPerPageSelect').addEventListener('change', (e)=>{
