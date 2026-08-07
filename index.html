@@ -2511,6 +2511,14 @@ function getRowSearchBlob(row){
   row.__searchBlob = blob;
   return blob;
 }
+// Duplicate-detection key: S No. ALONE is not safe — production exports restart S No. at 1
+// for every new export period (verified: two different months' files both run S No. 1..~617K).
+// S No. + Collection Date + Box Code together are what actually identify one real record.
+function duplicateKeyOf(row){
+  const d = row[COL.DATE] instanceof Date ? row[COL.DATE] : new Date(row[COL.DATE]);
+  const dateStr = isNaN(d) ? '' : d.toISOString().slice(0,10);
+  return row[COL.SNO]+'|'+dateStr+'|'+(row[COL.BOXCODE]||'');
+}
 document.getElementById('globalSearchInput').addEventListener('keydown', (e)=>{
   if(e.key==='Enter'){ e.preventDefault(); triggerGlobalSearch(); }
 });
@@ -3304,9 +3312,10 @@ async function ingestOneFileStreaming(file, fileIdx, fileCount, base, span, ctx)
       // cheap per-batch bookkeeping (duplicate/missing checks, queueing for
       // IndexedDB), which is what keeps the browser responsive on large imports.
       rows.forEach(row=>{
-        const key = row[COL.SNO];
-        if(key!==undefined && key!==''){
-          if(ctx.dupCheck.has(key)){ ctx.dupCount++; return; } // exact duplicate S No. — skip, first-imported copy wins
+        const sno = row[COL.SNO];
+        if(sno!==undefined && sno!==''){
+          const key = duplicateKeyOf(row);
+          if(ctx.dupCheck.has(key)){ ctx.dupCount++; return; } // exact duplicate (S No. + Date + Box Code) — skip, first-imported copy wins
           ctx.dupCheck.add(key);
         }
         if(!row[COL.DATE] || row[COL.DIVISION]===''){ ctx.missingCount++; }
@@ -3361,8 +3370,9 @@ async function ingestOneFileStreaming(file, fileIdx, fileCount, base, span, ctx)
               if(row[COL.DATE]!==undefined) row[COL.DATE] = parseDMY(row[COL.DATE]);
               if(row[COL.AMOUNT]!==undefined) row[COL.AMOUNT] = parseFloat(row[COL.AMOUNT])||0;
               normalizeRow(row);
-              const key = row[COL.SNO];
-              if(key!==undefined && key!==''){
+              const sno = row[COL.SNO];
+              if(sno!==undefined && sno!==''){
+                const key = duplicateKeyOf(row);
                 if(ctx.dupCheck.has(key)){ ctx.dupCount++; return; }
                 ctx.dupCheck.add(key);
               }
@@ -3402,8 +3412,9 @@ async function ingestOneFileStreaming(file, fileIdx, fileCount, base, span, ctx)
         const slice = json.slice(i, i+CHUNK);
         slice.forEach(row=>{
           normalizeRow(row);
-          const key = row[COL.SNO];
-          if(key!==undefined && key!==''){
+          const sno = row[COL.SNO];
+          if(sno!==undefined && sno!==''){
+            const key = duplicateKeyOf(row);
             if(ctx.dupCheck.has(key)){ ctx.dupCount++; return; }
             ctx.dupCheck.add(key);
           }
@@ -3448,7 +3459,7 @@ async function startImport(){
       // PREVIOUSLY imported data too, not just within this one import batch. In Replace
       // mode state.rows was already cleared above, so this Set starts empty there —
       // same as before.
-      dupCheck: new Set(state.rows.map(r=>r[COL.SNO])),
+      dupCheck: new Set(state.rows.filter(r=>r[COL.SNO]!==undefined && r[COL.SNO]!=='').map(duplicateKeyOf)),
       summaryDelta: new Map(), // this import's contribution to the additive summary — merged into state.summaryAgg once the import finishes
       dupCount: 0, missingCount: 0,
       flushSave: null
