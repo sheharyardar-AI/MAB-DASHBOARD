@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ur" dir="ltr">
+<html lang="en" dir="ltr">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -98,7 +98,7 @@ body{
   -webkit-font-smoothing:antialiased;
   overflow-x:hidden;
   transition: background .25s ease, color .25s ease;
-  direction:ltr; /* explicit — guards against an OS/browser-level forced-RTL override flipping the layout even though html already sets dir="ltr" */
+  direction:ltr !important; /* guards against an OS/browser-level forced-RTL override (e.g. an extension) flipping the layout even though html already sets dir="ltr" */
 }
 .urdu{ font-family: var(--font-ur); direction:rtl; }
 ::-webkit-scrollbar{width:8px; height:8px;}
@@ -111,7 +111,7 @@ a{text-decoration:none; color:inherit;}
 /* ============================================================
    APP SHELL
    ============================================================ */
-.app{ display:flex; flex-direction:row; direction:ltr; min-height:100vh; }
+.app{ display:flex; flex-direction:row !important; direction:ltr !important; min-height:100vh; }
 
 /* -------- SIDEBAR -------- */
 .sidebar{
@@ -122,7 +122,8 @@ a{text-decoration:none; color:inherit;}
   display:flex; flex-direction:column;
   transition: width .25s ease;
   z-index:40;
-  order:0;
+  order:0 !important;
+  direction:ltr !important;
 }
 .sidebar.collapsed{ width:var(--sidebar-w-collapsed); }
 .sidebar-brand{
@@ -220,7 +221,7 @@ input:checked + .slider:before{ transform:translateX(17px); }
 }
 
 /* -------- MAIN -------- */
-.main{ flex:1; min-width:0; display:flex; flex-direction:column; order:1; }
+.main{ flex:1; min-width:0; display:flex; flex-direction:column; order:1 !important; }
 
 /* HEADER */
 .header{
@@ -834,6 +835,23 @@ table.dg thead th.col-hidden, table.dg tbody td.col-hidden{ display:none; }
 </style>
 </head>
 <body data-theme="emerald" data-mode="light">
+<script>
+// Defends against a browser extension forcing RTL layout on this page (seen happening on
+// some desktop Chrome profiles, not on mobile — likely an extension keying off a language
+// attribute). Re-asserts LTR immediately if html/body's dir or direction ever get changed
+// by anything other than this page's own code.
+(function(){
+  function forceLTR(){
+    if(document.documentElement.getAttribute('dir')!=='ltr') document.documentElement.setAttribute('dir','ltr');
+    if(document.body && document.body.style.direction && document.body.style.direction!=='ltr') document.body.style.direction='ltr';
+  }
+  forceLTR();
+  try{
+    new MutationObserver(forceLTR).observe(document.documentElement, {attributes:true, attributeFilter:['dir','style']});
+    new MutationObserver(forceLTR).observe(document.body, {attributes:true, attributeFilter:['dir','style']});
+  }catch(e){}
+})();
+</script>
 
 <div class="app">
 
