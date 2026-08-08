@@ -2144,11 +2144,12 @@ function parseDMY(s){
 // buckets even at crores of rows, since it's the same real-world category structure
 // every time, just more rows landing in the same buckets.
 const SUMMARY_MONTH_NAMES = ['','January','February','March','April','May','June','July','August','September','October','November','December'];
+const SUMMARY_DIMS = ['Year','Month','Division','District','Status','Purpose','Box Type','Department']; // order MUST match summaryKeyOf()
 function summaryKeyOf(row){
   const d = new Date(row[COL.DATE]);
   const y = isNaN(d) ? '' : d.getFullYear();
   const m = isNaN(d) ? '' : SUMMARY_MONTH_NAMES[d.getMonth()+1]; // stored as a NAME — matches state.filterSel['Month'] exactly (see buildFilters' Month def)
-  return y+'|'+m+'|'+(row[COL.DIVISION]||'')+'|'+(row[COL.DISTRICT]||'')+'|'+(row[COL.STATUS]||'')+'|'+(row[COL.PURPOSE]||'')+'|'+(row[COL.BOXTYPE]||'');
+  return y+'|'+m+'|'+(row[COL.DIVISION]||'')+'|'+(row[COL.DISTRICT]||'')+'|'+(row[COL.STATUS]||'')+'|'+(row[COL.PURPOSE]||'')+'|'+(row[COL.BOXTYPE]||'')+'|'+(row[COL.DEPT]||'');
 }
 function addToSummary(summaryMap, row){
   const key = summaryKeyOf(row);
@@ -2621,6 +2622,8 @@ const state = {
   fileMeta: null,
   filterSel: {},       // { 'Division': ['Gujranwala'], ... } empty/absent = All
   table: { search:'', sortKey:null, sortDir:1, page:1, pageSize:10, hiddenCols:[], frozen:false, virtualMode:false },
+  largeDatasetMode: false, // true when raw rows were deliberately not loaded on restore (dataset too large) — summary still works
+  knownTotalRowCount: 0,   // total row count from storage, kept accurate even when rows isn't loaded
 };
 
 /* ============================================================
@@ -2931,6 +2934,7 @@ async function removeImportBatches(historyIds){
     state.summaryAgg = new Map();
     for(let i=0;i<state.rows.length;i++) addToSummary(state.summaryAgg, state.rows[i]);
     await safeIdb(()=>idbSetMeta('summaryAgg', [...state.summaryAgg.entries()]));
+    await safeIdb(()=>idbSetMeta('totalRowCount', state.rows.length));
     schedulePrewarmRiskCache(); // kick off a background Risk recompute now, before the user asks for it
     await idbClearChunks();
     const SAVE_CHUNK = 5000;
@@ -3498,6 +3502,7 @@ async function startImport(){
       e.count += v.count; e.sumAmount += v.sumAmount; e.sumDiffAmt += v.sumDiffAmt;
     });
     await safeIdb(()=>idbSetMeta('summaryAgg', [...state.summaryAgg.entries()]));
+    await safeIdb(()=>idbSetMeta('totalRowCount', state.rows.length));
     schedulePrewarmRiskCache(); // kick off a background Risk recompute now, before the user asks for it
     await safeIdb(()=>idbSetMeta('lastImport', {fileNames:files.map(f=>f.name), rowCount:state.rows.length, date:new Date().toISOString()}));
     await safeIdb(()=>idbSetMeta('hasData', true));
@@ -3943,26 +3948,40 @@ document.addEventListener('click', (e)=>{
 
 const filterRenderers = {};
 let FILTER_DEFS_BY_KEY = {};
+function summaryDistinctValues(dimKey){
+  const idx = SUMMARY_DIMS.indexOf(dimKey);
+  if(idx===-1 || !state.summaryAgg) return [];
+  const set = new Set();
+  state.summaryAgg.forEach((e,key)=>{
+    const v = key.split('|')[idx];
+    if(v!=='') set.add(v);
+  });
+  return [...set];
+}
 function buildFilters(rows){
   const filtersGrid = document.getElementById('filtersGrid');
   filtersGrid.innerHTML='';
-  const years = rows.length ? [...new Set(rows.map(r=>{ const d=new Date(r[COL.DATE]); return isNaN(d)?null:d.getFullYear(); }).filter(Boolean))].sort() : [];
-  const months = rows.length ? [...new Set(rows.map(r=>{ const d=new Date(r[COL.DATE]); return isNaN(d)?null:(d.getMonth()+1); }).filter(Boolean))].sort((a,b)=>a-b) : [];
+  const useSummaryForOptions = !rows.length && state.largeDatasetMode;
+  const years = rows.length ? [...new Set(rows.map(r=>{ const d=new Date(r[COL.DATE]); return isNaN(d)?null:d.getFullYear(); }).filter(Boolean))].sort()
+    : useSummaryForOptions ? summaryDistinctValues('Year').map(Number).sort() : [];
+  const months = rows.length ? [...new Set(rows.map(r=>{ const d=new Date(r[COL.DATE]); return isNaN(d)?null:(d.getMonth()+1); }).filter(Boolean))].sort((a,b)=>a-b)
+    : [];
   const monthNames = ['','January','February','March','April','May','June','July','August','September','October','November','December'];
+  const monthOptsFromSummary = useSummaryForOptions ? summaryDistinctValues('Month') : null; // already names, not numbers
 
   const defs = [
     {label:'Year', key:'Year', opts: years.map(String)},
-    {label:'Month', key:'Month', opts: months.map(m=>monthNames[m])},
+    {label:'Month', key:'Month', opts: monthOptsFromSummary || months.map(m=>monthNames[m])},
     {label:'View By', key:'ViewBy', opts:['Overview','Division','District','Employee','Branch','Box Type','Purpose','Status'], single:true},
     {label:'Analysis Mode', key:'AnalysisMode', opts:['Amount','Open Boxes','Open %','Empty Boxes','Closed Boxes','Growth %','Average Amount','Ranking']},
-    {label:'Division', key:'Division', opts: uniqueVals(rows, COL.DIVISION)},
-    {label:'District', key:'District', opts: uniqueVals(rows, COL.DISTRICT), cascade:true},
-    {label:'Department', key:'Department', opts: uniqueVals(rows, COL.DEPT), cascade:true},
-    {label:'Branch', key:'Branch', opts: uniqueVals(rows, COL.BRANCH).map(String), cascade:true},
-    {label:'Employee', key:'Employee', opts: employeeOptions(rows)},
-    {label:'Box Type', key:'Box Type', opts: uniqueVals(rows, COL.BOXTYPE)},
-    {label:'Purpose', key:'Purpose', opts: uniqueVals(rows, COL.PURPOSE)},
-    {label:'Status', key:'Status', opts: uniqueVals(rows, COL.STATUS)},
+    {label:'Division', key:'Division', opts: useSummaryForOptions ? summaryDistinctValues('Division') : uniqueVals(rows, COL.DIVISION)},
+    {label:'District', key:'District', opts: useSummaryForOptions ? summaryDistinctValues('District') : uniqueVals(rows, COL.DISTRICT), cascade:true},
+    {label:'Department', key:'Department', opts: useSummaryForOptions ? summaryDistinctValues('Department') : uniqueVals(rows, COL.DEPT), cascade:true},
+    {label:'Branch', key:'Branch', opts: useSummaryForOptions ? [] : uniqueVals(rows, COL.BRANCH).map(String), cascade:true},
+    {label:'Employee', key:'Employee', opts: useSummaryForOptions ? [] : employeeOptions(rows)},
+    {label:'Box Type', key:'Box Type', opts: useSummaryForOptions ? summaryDistinctValues('Box Type') : uniqueVals(rows, COL.BOXTYPE)},
+    {label:'Purpose', key:'Purpose', opts: useSummaryForOptions ? summaryDistinctValues('Purpose') : uniqueVals(rows, COL.PURPOSE)},
+    {label:'Status', key:'Status', opts: useSummaryForOptions ? summaryDistinctValues('Status') : uniqueVals(rows, COL.STATUS)},
   ];
 
   for(const k in filterRenderers) delete filterRenderers[k];
@@ -4077,9 +4096,32 @@ function cascadeFiltersImmediate(rows){
   const divSel = state.filterSel['Division'] || [];
   const distSel = state.filterSel['District'] || [];
   const deptSel = state.filterSel['Department'] || [];
+  const useSummary = !rows.length && state.largeDatasetMode;
 
-  const rowsForDistrict = divSel.length ? rows.filter(r=>divSel.includes(r[COL.DIVISION])) : rows;
-  const newDistrictOpts = uniqueVals(rowsForDistrict, COL.DISTRICT);
+  let newDistrictOpts, newDeptOpts;
+  if(useSummary){
+    // Summary-based narrowing: same two-step logic as the raw-row path, just filtering
+    // summary buckets by Division (then Division+District) instead of filtering rows.
+    const distSet = new Set(), deptSet = new Set();
+    const divIdx = SUMMARY_DIMS.indexOf('Division'), distIdx = SUMMARY_DIMS.indexOf('District'), deptIdx = SUMMARY_DIMS.indexOf('Department');
+    state.summaryAgg.forEach((e,key)=>{
+      const parts = key.split('|');
+      if(divSel.length && !divSel.includes(parts[divIdx])) return;
+      if(parts[distIdx]!=='') distSet.add(parts[distIdx]);
+    });
+    newDistrictOpts = [...distSet];
+    const effectiveDistForDept = (state.filterSel['District']||[]).filter(v=>newDistrictOpts.includes(v));
+    state.summaryAgg.forEach((e,key)=>{
+      const parts = key.split('|');
+      if(divSel.length && !divSel.includes(parts[divIdx])) return;
+      if(effectiveDistForDept.length && !effectiveDistForDept.includes(parts[distIdx])) return;
+      if(parts[deptIdx]!=='') deptSet.add(parts[deptIdx]);
+    });
+    newDeptOpts = [...deptSet];
+  } else {
+    const rowsForDistrict = divSel.length ? rows.filter(r=>divSel.includes(r[COL.DIVISION])) : rows;
+    newDistrictOpts = uniqueVals(rowsForDistrict, COL.DISTRICT);
+  }
   if(filterRenderers['District']){
     filterRenderers['District'].setOpts(newDistrictOpts);
     state.filterSel['District'] = (state.filterSel['District']||[]).filter(v=>newDistrictOpts.includes(v));
@@ -4088,8 +4130,9 @@ function cascadeFiltersImmediate(rows){
   }
 
   const effectiveDist = state.filterSel['District'] || [];
-  const rowsForDept = rowsForDistrict.filter(r=> !effectiveDist.length || effectiveDist.includes(r[COL.DISTRICT]));
-  const newDeptOpts = uniqueVals(rowsForDept, COL.DEPT);
+  const rowsForDistrict = useSummary ? [] : (divSel.length ? rows.filter(r=>divSel.includes(r[COL.DIVISION])) : rows);
+  const rowsForDept = useSummary ? [] : rowsForDistrict.filter(r=> !effectiveDist.length || effectiveDist.includes(r[COL.DISTRICT]));
+  if(!useSummary) newDeptOpts = uniqueVals(rowsForDept, COL.DEPT);
   if(filterRenderers['Department']){
     filterRenderers['Department'].setOpts(newDeptOpts);
     state.filterSel['Department'] = (state.filterSel['Department']||[]).filter(v=>newDeptOpts.includes(v));
@@ -4097,7 +4140,8 @@ function cascadeFiltersImmediate(rows){
     filterRenderers['Department'].updateSummary();
   }
 
-  // Department → Branch
+  // Department → Branch (Branch isn't summary-tracked — stays empty in large-dataset mode,
+  // consistent with its base option list)
   const effectiveDept = state.filterSel['Department'] || [];
   const rowsForBranch = rowsForDept.filter(r=> !effectiveDept.length || effectiveDept.includes(r[COL.DEPT]));
   const newBranchOpts = uniqueVals(rowsForBranch, COL.BRANCH).map(String);
@@ -4183,15 +4227,14 @@ async function applyRowFilters(rows){
    ============================================================ */
 // Phase 2/3 of the crores-of-rows plan: these functions let KPIs AND charts answer from
 // the small pre-aggregated summary instead of scanning every raw row — but ONLY when the
-// current filter selection doesn't touch a dimension the summary doesn't track (Department/
-// Branch/Employee), and (for charts) only when the thing being grouped/ranked BY is itself
+// current filter selection doesn't touch a dimension the summary doesn't track (Branch/
+// Employee), and (for charts) only when the thing being grouped/ranked BY is itself
 // a summary dimension. Growth % (daily/monthly trend), the daily Trend chart, and the
 // unique Employee/Branch counts always read from `rows` — summary can't answer those
 // (no daily granularity, and distinct counts can't just be summed across buckets).
-const SUMMARY_DIMS = ['Year','Month','Division','District','Status','Purpose','Box Type']; // order MUST match summaryKeyOf()
 function canUseSummaryForCurrentFilters(){
   if(!state.summaryAgg || !state.summaryAgg.size) return false;
-  const nonSummaryKeys = ['Department','Branch','Employee'];
+  const nonSummaryKeys = ['Branch','Employee'];
   for(let i=0;i<nonSummaryKeys.length;i++){
     const k = nonSummaryKeys[i];
     const sel = state.filterSel[k];
@@ -4474,8 +4517,12 @@ async function buildTable(){
   tbody.innerHTML=''; pager.innerHTML='';
 
   if(!state.rows.length){
-    tbody.innerHTML = `<tr><td colspan="11"><div class="empty-state">${ic.upload}<div class="e-t">کوئی ڈیٹا امپورٹ نہیں ہوا</div><div class="e-d">Sidebar سے "Import Data" پر کلک کریں</div>
-      <button class="btn-primary" onclick="openImportModal()">Import Data</button></div></td></tr>`;
+    if(state.largeDatasetMode){
+      tbody.innerHTML = `<tr><td colspan="11"><div class="empty-state">${ic.upload}<div class="e-t">ڈیٹا بہت بڑا ہے — Table فی الحال دستیاب نہیں</div><div class="e-d">${state.knownTotalRowCount.toLocaleString()} rows محفوظ ہیں (KPIs/رپورٹس کام کر رہی ہیں)۔ تفصیلی Table دیکھنے کے لیے Data → Import Data سے کچھ پرانی فائلیں Delete کریں تاکہ کل ڈیٹا کم ہو۔</div></div></td></tr>`;
+    } else {
+      tbody.innerHTML = `<tr><td colspan="11"><div class="empty-state">${ic.upload}<div class="e-t">کوئی ڈیٹا امپورٹ نہیں ہوا</div><div class="e-d">Sidebar سے "Import Data" پر کلک کریں</div>
+        <button class="btn-primary" onclick="openImportModal()">Import Data</button></div></td></tr>`;
+    }
     footerSpan.textContent = 'Showing 0 of 0 entries';
     return;
   }
@@ -4723,7 +4770,8 @@ document.getElementById('applyFiltersBtn').addEventListener('click', async ()=>{
   state.table.page = 1;
   refreshActivePage();
   schedulePrewarmRiskCache();
-  document.getElementById('phaseState').textContent = state.active.length.toLocaleString()+' / '+state.rows.length.toLocaleString()+' Rows (Filtered)';
+  const totalLabel = state.largeDatasetMode ? state.knownTotalRowCount.toLocaleString()+' (Summary Mode)' : state.rows.length.toLocaleString();
+  document.getElementById('phaseState').textContent = state.active.length.toLocaleString()+' / '+totalLabel+' Rows (Filtered)';
   toast('success','Filters Applied — فلٹرز لاگو ہو گئے', state.active.length.toLocaleString()+' rows matched');
   idbSetMeta('lastFilterSel', state.filterSel);
 
@@ -5191,7 +5239,7 @@ async function buildDashboard(preserveFilters){
   if(!preserveFilters) state.filterSel = {};
   state.active = preserveFilters && Object.keys(state.filterSel).length ? await applyRowFilters(rows) : rows;
   state.table = { search:'', sortKey:null, sortDir:1, page:1, pageSize: state.settings.rowsPerPage||10, hiddenCols: state.table.hiddenCols||[], frozen: state.table.frozen||false, virtualMode: state.table.virtualMode||false };
-  document.getElementById('phaseState').textContent = rows.length ? (rows.length.toLocaleString()+' Rows Loaded') : 'No Data Imported';
+  document.getElementById('phaseState').textContent = rows.length ? (rows.length.toLocaleString()+' Rows Loaded') : (state.largeDatasetMode ? (state.knownTotalRowCount.toLocaleString()+' Rows (Summary Mode)') : 'No Data Imported');
   buildFilters(rows);
   buildKPIs(state.active);
   buildInsights(state.active);
@@ -5280,44 +5328,69 @@ async function autoRestore(){
     // 2) imported data
     const hasData = await idbGetMeta('hasData');
     if(hasData){
-      const chunks = await idbGetAllChunks();
-      let all = [];
-      chunks.forEach(c=> all = all.concat(c.rows));
+      // Cheap check BEFORE touching idbGetAllChunks() (which is what actually crashes at
+      // large scale — it materializes every stored row into memory in one shot). Above
+      // this threshold we deliberately do NOT load raw rows on startup: KPIs, most charts,
+      // and District/Division/Purpose/Box Type/Status/Department reports all run from the
+      // summary and stay fully functional; Table view and Employee/Branch reports (which
+      // genuinely need raw rows) are the known gap until on-demand loading is built.
+      const LARGE_DATASET_ROW_THRESHOLD = 800000;
+      const knownTotal = await idbGetMeta('totalRowCount');
 
-      // ROOT-CAUSE FIX: previously-saved data (imported before, or by, an older
-      // version of the normalization engine) was being loaded back verbatim —
-      // normalizeRow() only ever ran at import time, never on restore. That's
-      // why ".0" duplicates kept coming back after every reload even though new
-      // imports were clean. This repairs it in memory immediately, and — if
-      // anything needed fixing — rewrites the stored chunks once so it's a
-      // permanent, one-time repair rather than something re-run every load.
-      const repairedRowCount = repairIdentifiersInPlace(all);
-
-      state.rows = all;
-      dataGeneration++;
-      const savedSummary = await idbGetMeta('summaryAgg');
-      if(savedSummary && savedSummary.length){
-        state.summaryAgg = new Map(savedSummary);
-      } else if(state.rows.length){
-        state.summaryAgg = new Map();
-        for(let i=0;i<state.rows.length;i++) addToSummary(state.summaryAgg, state.rows[i]);
-        safeIdb(()=>idbSetMeta('summaryAgg', [...state.summaryAgg.entries()]));
+      if(typeof knownTotal==='number' && knownTotal > LARGE_DATASET_ROW_THRESHOLD){
+        state.rows = [];
+        state.largeDatasetMode = true;
+        state.knownTotalRowCount = knownTotal;
+        dataGeneration++;
+        const savedSummary = await idbGetMeta('summaryAgg');
+        state.summaryAgg = (savedSummary && savedSummary.length) ? new Map(savedSummary) : new Map();
+        toast('info','بڑا ڈیٹا — Summary Mode', knownTotal.toLocaleString()+' rows محفوظ ہیں۔ KPIs اور خلاصہ رپورٹس کام کریں گی۔ تفصیلی Table/Employee رپورٹس کے لیے فی الحال کم ڈیٹا (Delete کر کے) رکھیں۔');
       } else {
-        state.summaryAgg = new Map();
+        state.largeDatasetMode = false;
+        let all = [];
+        try{
+          const chunks = await idbGetAllChunks();
+          chunks.forEach(c=> all = all.concat(c.rows));
+        }catch(loadErr){
+          console.warn('Row restore failed (IndexedDB itself is fine — this was the in-memory load):', loadErr);
+          toast('warning','مکمل ڈیٹا لوڈ نہیں ہو سکا', 'Summary اب بھی دستیاب ہے۔ Data → Backup & Restore سے کم ڈیٹا رکھنے پر غور کریں۔');
+        }
+
+        // ROOT-CAUSE FIX: previously-saved data (imported before, or by, an older
+        // version of the normalization engine) was being loaded back verbatim —
+        // normalizeRow() only ever ran at import time, never on restore. That's
+        // why ".0" duplicates kept coming back after every reload even though new
+        // imports were clean. This repairs it in memory immediately, and — if
+        // anything needed fixing — rewrites the stored chunks once so it's a
+        // permanent, one-time repair rather than something re-run every load.
+        const repairedRowCount = repairIdentifiersInPlace(all);
+
+        state.rows = all;
+        dataGeneration++;
+        const savedSummary = await idbGetMeta('summaryAgg');
+        if(savedSummary && savedSummary.length){
+          state.summaryAgg = new Map(savedSummary);
+        } else if(state.rows.length){
+          state.summaryAgg = new Map();
+          for(let i=0;i<state.rows.length;i++) addToSummary(state.summaryAgg, state.rows[i]);
+          safeIdb(()=>idbSetMeta('summaryAgg', [...state.summaryAgg.entries()]));
+        } else {
+          state.summaryAgg = new Map();
+        }
+        const meta = await idbGetMeta('lastImport');
+        if(meta && all.length) toast('success','Data Restored — ڈیٹا بحال ہوگیا', meta.rowCount.toLocaleString()+' rows ('+(meta.fileNames? meta.fileNames.join(', ') : (meta.fileName||''))+')');
+
+        if(repairedRowCount>0){
+          toast('info','Employee/Box Codes Repaired — کوڈز درست کیے گئے', repairedRowCount.toLocaleString()+' پرانی rows میں غلط ".0" ہٹا دیا گیا');
+          safeIdb(async ()=>{
+            await idbClearChunks();
+            const CHUNK = 5000, chunksOut = [];
+            for(let i=0;i<all.length;i+=CHUNK) chunksOut.push({ id:'chunk_repaired_'+i, rows: all.slice(i, i+CHUNK) });
+            await idbPutChunksBulk(chunksOut);
+          }, null);
+        }
       }
       schedulePrewarmRiskCache(); // kick off a background Risk recompute now, before the user asks for it
-      const meta = await idbGetMeta('lastImport');
-      if(meta) toast('success','Data Restored — ڈیٹا بحال ہوگیا', meta.rowCount.toLocaleString()+' rows ('+(meta.fileNames? meta.fileNames.join(', ') : (meta.fileName||''))+')');
-
-      if(repairedRowCount>0){
-        toast('info','Employee/Box Codes Repaired — کوڈز درست کیے گئے', repairedRowCount.toLocaleString()+' پرانی rows میں غلط ".0" ہٹا دیا گیا');
-        safeIdb(async ()=>{
-          await idbClearChunks();
-          const CHUNK = 5000, chunksOut = [];
-          for(let i=0;i<all.length;i+=CHUNK) chunksOut.push({ id:'chunk_repaired_'+i, rows: all.slice(i, i+CHUNK) });
-          await idbPutChunksBulk(chunksOut);
-        }, null);
-      }
 
       // fix any pre-existing data that predates the Import Manager (makes it visible + deletable)
       const fixed = await reconcileImportHistory();
@@ -5327,7 +5400,7 @@ async function autoRestore(){
     // 3) last filter selections (applied on top of restored data)
     const savedFilters = await idbGetMeta('lastFilterSel');
     if(savedFilters && Object.keys(savedFilters).length) state.filterSel = savedFilters;
-  }catch(err){ console.warn('Auto-restore skipped:', err); idbAvailable = false; }
+  }catch(err){ console.warn('Auto-restore skipped:', err); }
   buildDashboard(true);
 }
 autoRestore();
@@ -5352,6 +5425,56 @@ function buildDimMonthMatrixData(rows, monthsToShow, dimCol, dimValues){
   return data;
 }
 let currentAnalysisDim = null, currentAnalysisDimLabel = null;
+// Maps a COL.* value back to the filter-key name used in SUMMARY_DIMS/state.filterSel.
+const COL_TO_SUMMARY_DIM = {
+  [COL.DIVISION]:'Division', [COL.DISTRICT]:'District', [COL.STATUS]:'Status',
+  [COL.PURPOSE]:'Purpose', [COL.BOXTYPE]:'Box Type', [COL.DEPT]:'Department'
+};
+// Phase 7: Dimension×Month report matrix (District/Division/Purpose/Box Type/Status/Department
+// Reports all render through renderAnalysisPage) computed from the summary instead of scanning
+// every raw row. Returns null when dimCol isn't a summary-tracked dimension (Employee/Branch),
+// so callers fall back to the exact original raw-row computation unchanged.
+function computeMatrixFromSummary(dimCol, monthsToShow){
+  const dimKey = COL_TO_SUMMARY_DIM[dimCol];
+  if(!dimKey) return null;
+  const dimIdx = SUMMARY_DIMS.indexOf(dimKey);
+  const monthIdx = SUMMARY_DIMS.indexOf('Month');
+  const statusIdx = SUMMARY_DIMS.indexOf('Status');
+  const monthNumByName = {}; for(let i=1;i<=12;i++) monthNumByName[SUMMARY_MONTH_NAMES[i]] = i;
+  const filterSel = state.filterSel;
+
+  // Pass 1: every distinct dim value present under the current filter (any month) —
+  // matches uniqueVals(state.active, dimCol) semantics exactly.
+  const dimValuesSet = new Set();
+  state.summaryAgg.forEach((e,key)=>{
+    const parts = key.split('|');
+    if(!summaryBucketPasses(parts, filterSel)) return;
+    const v = parts[dimIdx];
+    if(v!=='') dimValuesSet.add(v);
+  });
+  const dimValues = [...dimValuesSet];
+
+  // Pass 2: fill the matrix, pre-initialized to zero for every (dimValue, shown month) —
+  // matches buildDimMonthMatrixData's behaviour of always having a cell even if empty.
+  const data = {};
+  dimValues.forEach(v=>{ data[v]={}; monthsToShow.forEach(m=>{ data[v][m]={amount:0,total:0,open:0,closed:0,empty:0,openPct:0}; }); });
+  state.summaryAgg.forEach((e,key)=>{
+    const parts = key.split('|');
+    if(!summaryBucketPasses(parts, filterSel)) return;
+    const v = parts[dimIdx];
+    if(v==='' || !data[v]) return;
+    const monthNum = monthNumByName[parts[monthIdx]];
+    if(!monthNum || !data[v][monthNum]) return;
+    const status = parts[statusIdx];
+    const cell = data[v][monthNum];
+    cell.amount += e.sumAmount; cell.total += e.count;
+    if(status==='Normal Collection' || status==='Walk in Collection') cell.open += e.count;
+    else if(status==='Shop Closed') cell.closed += e.count;
+    else if(status==='Box Empty') cell.empty += e.count;
+  });
+  dimValues.forEach(v=> monthsToShow.forEach(m=>{ const c=data[v][m]; c.openPct = c.total ? (c.open/c.total*100) : 0; }));
+  return {data, dimValues};
+}
 function renderAnalysisPage(dimCol, label){
   currentAnalysisDim = dimCol; currentAnalysisDimLabel = label;
   const rows = state.active.length || state.filterSel && Object.keys(state.filterSel).length ? state.active : state.rows;
@@ -5359,8 +5482,28 @@ function renderAnalysisPage(dimCol, label){
   document.getElementById('analysisTableTitle').textContent = label+' — Dimension × Month Matrix';
 
   const monthsToShow = selectedMonthNumbers() || [1,2,3,4,5,6,7,8,9,10,11,12];
-  const allDimValues = uniqueVals(rows, dimCol).map(String);
-  const capResult = capDimValuesByAmount(rows, dimCol, allDimValues, MATRIX_ROW_CAP);
+  const useSummary = canUseSummaryForCurrentFilters() && !!COL_TO_SUMMARY_DIM[dimCol];
+  const summaryResult = useSummary ? computeMatrixFromSummary(dimCol, monthsToShow) : null;
+
+  let matrixData, overall, capResult;
+  if(summaryResult){
+    const allDimValues = summaryResult.dimValues;
+    matrixData = summaryResult.data;
+    if(allDimValues.length <= MATRIX_ROW_CAP){
+      capResult = {shown: allDimValues, truncated:false, totalCount: allDimValues.length};
+    } else {
+      const ranked = allDimValues.map(v=>({v, amt: monthsToShow.reduce((s,m)=>s+matrixData[v][m].amount,0)})).sort((a,b)=>b.amt-a.amt).map(x=>x.v);
+      capResult = {shown: ranked.slice(0,MATRIX_ROW_CAP), truncated:true, totalCount: allDimValues.length};
+    }
+    const ov = {amount:0,total:0,open:0,closed:0,empty:0};
+    allDimValues.forEach(v=> monthsToShow.forEach(m=>{ const c=matrixData[v][m]; ov.amount+=c.amount; ov.total+=c.total; ov.open+=c.open; ov.closed+=c.closed; ov.empty+=c.empty; }));
+    overall = {...ov, openPct: ov.total ? (ov.open/ov.total*100) : 0};
+  } else {
+    const allDimValues = uniqueVals(rows, dimCol).map(String);
+    capResult = capDimValuesByAmount(rows, dimCol, allDimValues, MATRIX_ROW_CAP);
+    matrixData = buildDimMonthMatrixData(rows, monthsToShow, dimCol, capResult.shown);
+    overall = computeMetrics(rows);
+  }
   const dimValues = capResult.shown;
 
   let rowDefs;
@@ -5370,13 +5513,11 @@ function renderAnalysisPage(dimCol, label){
     rowDefs = dimValues.map(v=>({key:v, label:v}));
   }
   const colDefs = monthsToShow.map(m=>({key:m, label:MONTH_NAMES[m].slice(0,3)}));
-  const matrixData = buildDimMonthMatrixData(rows, monthsToShow, dimCol, dimValues);
 
   document.getElementById('analysisTableSub').textContent = capResult.truncated
     ? 'Showing top '+MATRIX_ROW_CAP+' of '+capResult.totalCount+' by '+COL.AMOUNT+' — Selected months only'
     : 'Selected months only';
 
-  const overall = computeMetrics(rows);
   const topByAmount = [...dimValues].map(v=>({v, amt: monthsToShow.reduce((s,m)=>s+matrixData[v][m].amount,0)})).sort((a,b)=>b.amt-a.amt)[0];
   const topLabel = topByAmount ? (rowDefs.find(r=>r.key===topByAmount.v)||{label:topByAmount.v}).label : '—';
 
