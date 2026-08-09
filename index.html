@@ -3506,7 +3506,7 @@ async function startImport(){
 
   try{
     setProgress(1, 'Starting import of '+fileCount+' file'+(fileCount>1?'s':'')+'...');
-    if(state.importMode==='replace'){ await safeIdb(()=>idbClearChunks()); state.rows = []; }
+    if(state.importMode==='replace'){ await safeIdb(()=>idbClearChunks()); state.rows = []; await safeIdb(()=>idbSetMeta('importHistory', [])); }
 
     const SAVE_CHUNK = 5000;
     const batchStamp = Date.now();
@@ -4363,7 +4363,7 @@ function buildKPIs(rows){
   const openPct = rowCount ? (openBoxes/rowCount*100) : 0;
 
   // month-over-month growth based on currently displayed rows
-  const agg = monthAgg(rows).filter(a=>a.total>0);
+  const agg = (canUseSummaryForCurrentFilters() ? monthAggFromSummary([1,2,3,4,5,6,7,8,9,10,11,12]) : monthAgg(rows)).filter(a=>a.total>0);
   let growthPct = null;
   if(agg.length>=2){ const g = growthEngine(agg[agg.length-1].total, agg[agg.length-2].total); growthPct = g.pct; }
 
@@ -4426,42 +4426,64 @@ function buildKPIs(rows){
 function buildInsights(rows){
   const panel = document.getElementById('insightsPanel');
   panel.innerHTML='';
-  if(!rows.length){
+  const useSummary = !rows.length && canUseSummaryForCurrentFilters();
+  if(!rows.length && !useSummary){
     panel.innerHTML = `<div class="empty-state" style="padding:20px;">${ic.info}<div class="e-t">No Data Yet</div><div class="e-d urdu">ڈیٹا امپورٹ کرنے کے بعد بصیرت یہاں ظاہر ہوگی</div></div>`;
     return;
   }
-  const byDistrict = groupSum(rows, COL.DISTRICT, COL.AMOUNT);
-  const byEmp = groupSum(rows, COL.EMP, COL.AMOUNT);
-  const byBranch = groupSum(rows, COL.BRANCH, COL.AMOUNT);
-  const agg = monthAgg(rows).filter(a=>a.total>0);
+  const byDistrict = useSummary ? summaryGroupBy('District','sumAmount') : groupSum(rows, COL.DISTRICT, COL.AMOUNT);
+  const byEmp = useSummary ? [] : groupSum(rows, COL.EMP, COL.AMOUNT);
+  const byBranch = useSummary ? [] : groupSum(rows, COL.BRANCH, COL.AMOUNT);
+  const agg = (useSummary ? monthAggFromSummary([1,2,3,4,5,6,7,8,9,10,11,12]) : monthAgg(rows)).filter(a=>a.total>0);
   const bestMonth = agg.length? agg.reduce((a,b)=>a.total>b.total?a:b) : null;
   const worstMonth = agg.length? agg.reduce((a,b)=>a.total<b.total?a:b) : null;
   const bestGrowth = agg.length? agg.reduce((a,b)=>a.growth>b.growth?a:b) : null;
   const worstGrowth = agg.length? agg.reduce((a,b)=>a.growth<b.growth?a:b) : null;
-  const closedPct = (countWhere(rows,COL.STATUS,'Shop Closed')/rows.length*100);
-  const emptyPct = (countWhere(rows,COL.STATUS,'Box Empty')/rows.length*100);
+  let closedPct, emptyPct, totalRowsForInsight, districtCountForInsight;
+  if(useSummary){
+    const core = computeKPICoreFromSummary();
+    closedPct = core.count ? (core.closed/core.count*100) : 0;
+    emptyPct = core.count ? (core.empty/core.count*100) : 0;
+    totalRowsForInsight = state.knownTotalRowCount || core.count;
+    districtCountForInsight = byDistrict.length;
+  } else {
+    closedPct = (countWhere(rows,COL.STATUS,'Shop Closed')/rows.length*100);
+    emptyPct = (countWhere(rows,COL.STATUS,'Box Empty')/rows.length*100);
+    totalRowsForInsight = rows.length;
+    districtCountForInsight = uniqueVals(rows,COL.DISTRICT).length;
+  }
 
-  const topEmpName = byEmp[0] ? (rows.find(r=>String(r[COL.EMP])===String(byEmp[0].name))||{})[COL.ZIMMADAR] : '';
+  const topEmpName = (!useSummary && byEmp[0]) ? (rows.find(r=>String(r[COL.EMP])===String(byEmp[0].name))||{})[COL.ZIMMADAR] : '';
   const insights = [];
   const viewBySel = (state.filterSel['ViewBy'] && state.filterSel['ViewBy'][0]) || 'Overview';
   const VIEWBY_COL_MAP2 = { 'Division':COL.DIVISION, 'District':COL.DISTRICT, 'Employee':COL.EMP, 'Branch':COL.BRANCH, 'Box Type':COL.BOXTYPE, 'Purpose':COL.PURPOSE, 'Status':COL.STATUS };
   if(viewBySel!=='Overview' && VIEWBY_COL_MAP2[viewBySel]){
-    const byDim = groupSum(rows, VIEWBY_COL_MAP2[viewBySel], COL.AMOUNT);
-    insights.push({ic:'star', c:'var(--accent-grad)', t:'Top '+viewBySel+' (View By)', d:(byDim[0]?.name||'—')+' — PKR '+Math.round(byDim[0]?.value||0).toLocaleString()});
+    const viewByDimKey = COL_TO_SUMMARY_DIM[VIEWBY_COL_MAP2[viewBySel]];
+    const byDim = (useSummary && viewByDimKey) ? summaryGroupBy(viewByDimKey,'sumAmount') : (useSummary ? [] : groupSum(rows, VIEWBY_COL_MAP2[viewBySel], COL.AMOUNT));
+    if(!useSummary || viewByDimKey){
+      insights.push({ic:'star', c:'var(--accent-grad)', t:'Top '+viewBySel+' (View By)', d:(byDim[0]?.name||'—')+' — PKR '+Math.round(byDim[0]?.value||0).toLocaleString()});
+    }
   }
   insights.push(
     {ic:'star', c:'linear-gradient(135deg,#10b981,#047857)', t:'Best Performing District', d:(byDistrict[0]?.name||'—')+' — PKR '+Math.round(byDistrict[0]?.value||0).toLocaleString()},
-    {ic:'box', c:'linear-gradient(135deg,#0f172a,#334155)', t:'Lowest Performing District', d:(byDistrict[byDistrict.length-1]?.name||'—')+' — PKR '+Math.round(byDistrict[byDistrict.length-1]?.value||0).toLocaleString()},
-    {ic:'rank', c:'linear-gradient(135deg,#8b5cf6,#5b21b6)', t:'Top Employee', d:(byEmp[0]? byEmp[0].name+' | '+topEmpName : '—')+' — PKR '+Math.round(byEmp[0]?.value||0).toLocaleString()},
-    {ic:'layers', c:'linear-gradient(135deg,#3b82f6,#1e3a8a)', t:'Top Branch', d:(byBranch[0]?.name||'—')+' — PKR '+Math.round(byBranch[0]?.value||0).toLocaleString()}
+    {ic:'box', c:'linear-gradient(135deg,#0f172a,#334155)', t:'Lowest Performing District', d:(byDistrict[byDistrict.length-1]?.name||'—')+' — PKR '+Math.round(byDistrict[byDistrict.length-1]?.value||0).toLocaleString()}
   );
+  if(useSummary){
+    insights.push({ic:'rank', c:'linear-gradient(135deg,#8b5cf6,#5b21b6)', t:'Top Employee', d:'Summary Mode میں دستیاب نہیں — کم ڈیٹا رکھیں'});
+    insights.push({ic:'layers', c:'linear-gradient(135deg,#3b82f6,#1e3a8a)', t:'Top Branch', d:'Summary Mode میں دستیاب نہیں — کم ڈیٹا رکھیں'});
+  } else {
+    insights.push(
+      {ic:'rank', c:'linear-gradient(135deg,#8b5cf6,#5b21b6)', t:'Top Employee', d:(byEmp[0]? byEmp[0].name+' | '+topEmpName : '—')+' — PKR '+Math.round(byEmp[0]?.value||0).toLocaleString()},
+      {ic:'layers', c:'linear-gradient(135deg,#3b82f6,#1e3a8a)', t:'Top Branch', d:(byBranch[0]?.name||'—')+' — PKR '+Math.round(byBranch[0]?.value||0).toLocaleString()}
+    );
+  }
   if(bestMonth) insights.push({ic:'trend', c:'linear-gradient(135deg,#10b981,#047857)', t:'Best Month', d:bestMonth.name+' — PKR '+Math.round(bestMonth.total).toLocaleString()});
   if(worstMonth) insights.push({ic:'box', c:'linear-gradient(135deg,#ef4444,#b91c1c)', t:'Worst Month', d:worstMonth.name+' — PKR '+Math.round(worstMonth.total).toLocaleString()});
   if(bestGrowth && bestGrowth.growth>0) insights.push({ic:'growth', c:'linear-gradient(135deg,#10b981,#047857)', t:'Highest Growth', d:bestGrowth.name+' — +'+bestGrowth.growth.toFixed(2)+'%'});
   if(worstGrowth && worstGrowth.growth<0) insights.push({ic:'growth', c:'linear-gradient(135deg,#ef4444,#b91c1c)', t:'Highest Decline', d:worstGrowth.name+' — '+worstGrowth.growth.toFixed(2)+'%'});
   if(closedPct>10) insights.push({ic:'box', c:'linear-gradient(135deg,#f59e0b,#b45309)', t:'Alert — Attention Needed', d: closedPct.toFixed(1)+'% receipts marked Shop Closed'});
   if(emptyPct>10) insights.push({ic:'box', c:'linear-gradient(135deg,#f59e0b,#b45309)', t:'Alert — Box Empty Rate High', d: emptyPct.toFixed(1)+'% boxes marked Empty'});
-  insights.push({ic:'grid', c:'linear-gradient(135deg,#3b82f6,#1e3a8a)', t:'Total Records', d: rows.length.toLocaleString()+' rows across '+uniqueVals(rows,COL.DISTRICT).length+' districts'});
+  insights.push({ic:'grid', c:'linear-gradient(135deg,#3b82f6,#1e3a8a)', t:'Total Records', d: totalRowsForInsight.toLocaleString()+' rows across '+districtCountForInsight+' districts'});
 
   insights.forEach(x=>{
     const r = document.createElement('div'); r.className='insight-row';
@@ -5701,6 +5723,52 @@ function exportAnalysisPDF(){
    ============================================================ */
 const MONTH_NAMES = ['','January','February','March','April','May','June','July','August','September','October','November','December'];
 let lastTimeAgg = [];
+function monthAggFromSummary(monthsToShow){
+  const filterSel = state.filterSel;
+  const monthIdx = SUMMARY_DIMS.indexOf('Month'), statusIdx = SUMMARY_DIMS.indexOf('Status');
+  const monthNumByName = {}; for(let i=1;i<=12;i++) monthNumByName[SUMMARY_MONTH_NAMES[i]] = i;
+  const byMonth = {}; monthsToShow.forEach(m=>{ byMonth[m] = {amount:0,total:0,open:0,closed:0,empty:0}; });
+  state.summaryAgg.forEach((e,key)=>{
+    const parts = key.split('|');
+    if(!summaryBucketPasses(parts, filterSel)) return;
+    const mn = monthNumByName[parts[monthIdx]];
+    if(!mn || !byMonth[mn]) return;
+    const status = parts[statusIdx];
+    const b = byMonth[mn];
+    b.amount += e.sumAmount; b.total += e.count;
+    if(status==='Normal Collection' || status==='Walk in Collection') b.open += e.count;
+    else if(status==='Shop Closed') b.closed += e.count;
+    else if(status==='Box Empty') b.empty += e.count;
+  });
+  const out = monthsToShow.map(m=>{
+    const b = byMonth[m];
+    const openPct = b.total ? (b.open/b.total*100) : 0;
+    return { m, name:MONTH_NAMES[m], total:b.amount, amount:b.amount, recordCount:b.total, open:b.open, closed:b.closed, empty:b.empty, openPct };
+  });
+  out.forEach((a,i)=>{ a.growth = i===0 ? 0 : (growthEngine(a.total, out[i-1].total).pct ?? 0); });
+  return out;
+}
+function yearMonthAggFromSummary(){
+  const filterSel = state.filterSel;
+  const yearIdx = SUMMARY_DIMS.indexOf('Year'), monthIdx = SUMMARY_DIMS.indexOf('Month');
+  const monthNumByName = {}; for(let i=1;i<=12;i++) monthNumByName[SUMMARY_MONTH_NAMES[i]] = i;
+  const yearsSet = new Set();
+  state.summaryAgg.forEach((e,key)=>{
+    const parts = key.split('|');
+    if(!summaryBucketPasses(parts, filterSel)) return;
+    if(parts[yearIdx]!=='') yearsSet.add(Number(parts[yearIdx]));
+  });
+  const years = [...yearsSet].sort((a,b)=>a-b);
+  const data = {}; years.forEach(y=> data[y] = Array(12).fill(0));
+  state.summaryAgg.forEach((e,key)=>{
+    const parts = key.split('|');
+    if(!summaryBucketPasses(parts, filterSel)) return;
+    const y = Number(parts[yearIdx]); if(!data[y]) return;
+    const mn = monthNumByName[parts[monthIdx]]; if(!mn) return;
+    data[y][mn-1] += e.sumAmount;
+  });
+  return {years, data};
+}
 function monthAgg(rows, onlyMonths){
   const monthsToShow = (onlyMonths && onlyMonths.length) ? onlyMonths.slice().sort((a,b)=>a-b) : [1,2,3,4,5,6,7,8,9,10,11,12];
   const buckets = {}; monthsToShow.forEach(m=> buckets[m]=[]);
@@ -5750,8 +5818,10 @@ function renderTimePage(mode){
   document.getElementById('dmMonthWise').classList.toggle('active', mode==='monthwise');
   document.getElementById('dmGrowth').classList.toggle('active', mode==='growth');
   const rows = state.active.length || Object.keys(state.filterSel||{}).length ? state.active : state.rows;
+  const useSummary = canUseSummaryForCurrentFilters();
   const onlyMonths = selectedMonthNumbers();
-  const agg = monthAgg(rows, onlyMonths);
+  const monthsToShow = (onlyMonths && onlyMonths.length) ? onlyMonths.slice().sort((a,b)=>a-b) : [1,2,3,4,5,6,7,8,9,10,11,12];
+  const agg = useSummary ? monthAggFromSummary(monthsToShow) : monthAgg(rows, onlyMonths);
   lastTimeAgg = agg;
   const withData = agg.filter(a=>a.total>0);
   const grandTotal = agg.reduce((s,a)=>s+a.total,0);
@@ -5774,7 +5844,7 @@ function renderTimePage(mode){
 
   const tc = themeColors(); const textStyle = {color:tc.text, fontFamily:'Inter', fontSize:11};
   const c1 = safeInit('chartTimeMain');
-  const { years, data:yearData } = yearMonthAgg(rows);
+  const { years, data:yearData } = useSummary ? yearMonthAggFromSummary() : yearMonthAgg(rows);
   const yearColors = [tc.accent, '#3b82f6', '#f59e0b', '#8b5cf6', '#ef4444', '#0f172a'];
 
   if(mode==='growth'){
@@ -6136,7 +6206,7 @@ function exportEmpYearlyExcel(){
    ============================================================ */
 function renderForecastPage(){
   const rows = state.active.length || Object.keys(state.filterSel||{}).length ? state.active : state.rows;
-  const agg = monthAgg(rows).filter(a=>a.total>0);
+  const agg = (canUseSummaryForCurrentFilters() ? monthAggFromSummary([1,2,3,4,5,6,7,8,9,10,11,12]) : monthAgg(rows)).filter(a=>a.total>0);
   const kGrid = document.getElementById('forecastKpiGrid'); kGrid.innerHTML='';
   const tc = themeColors(); const textStyle = {color:tc.text, fontFamily:'Inter', fontSize:11};
   const c1 = safeInit('chartForecast');
