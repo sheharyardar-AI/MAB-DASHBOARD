@@ -2130,11 +2130,11 @@ function normalizeRow(row){
 // browser, and new Date('01/12/2025') silently misparses as MM/DD (Jan 12, not Dec 1) —
 // so dates must be parsed explicitly, not handed to the Date constructor as-is.
 function parseDMY(s){
-  if(s==null || s==='') return null;
-  if(s instanceof Date) return isNaN(s) ? null : s;
+  if(s==null || s==='') return undefined; // NEVER null — new Date(null) is a valid epoch date, new Date(undefined) is correctly Invalid Date
+  if(s instanceof Date) return isNaN(s) ? undefined : s;
   const m = String(s).trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-  if(m){ const d = new Date(+m[3], +m[2]-1, +m[1]); return isNaN(d) ? null : d; }
-  const d = new Date(s); return isNaN(d) ? null : d;
+  if(m){ const d = new Date(+m[3], +m[2]-1, +m[1]); return isNaN(d) ? undefined : d; }
+  const d = new Date(s); return isNaN(d) ? undefined : d;
 }
 // ---- Additive summary aggregation (Phase 1 — not yet consumed by any chart/KPI) ----
 // Bucketed by Year|Month|Division|District|Status: every value inside a bucket is a
@@ -2630,6 +2630,11 @@ const state = {
    INDEXEDDB LAYER — Offline-first persistence
    ============================================================ */
 const DB_NAME = 'CollectionAnalyticsDB';
+// Above this row count, raw rows are deliberately NOT loaded into memory on restore
+// (see autoRestore) — idbGetAllChunks() materializing everything at once is what was
+// observed crashing at multi-million-row scale. Shared with removeImportBatches so
+// deletion can detect and safely handle this mode too.
+const LARGE_DATASET_ROW_THRESHOLD = 800000;
 const DB_VERSION = 1;
 let dbInstance = null;
 let idbAvailable = true; // flips false permanently this session if IndexedDB's backing store can't open
@@ -2724,6 +2729,23 @@ async function idbGetAllChunks(){
     const rq = tx.objectStore('chunks').getAll();
     rq.onsuccess = ()=>res(rq.result || []);
     rq.onerror = e=>rej(dbErr(e,'Failed reading stored data'));
+  });
+}
+// Memory-safe alternative to idbGetAllChunks(): visits one chunk record at a time via a
+// cursor, so the caller never holds more than one chunk (a few thousand rows) in memory
+// at once — critical for operations (like deletion) that must work correctly even when
+// the dataset is too large to load wholesale (see LARGE_DATASET_ROW_THRESHOLD).
+async function idbForEachChunk(onChunk){
+  const db = await openDB();
+  return new Promise((res,rej)=>{
+    const tx = db.transaction('chunks','readonly');
+    const req = tx.objectStore('chunks').openCursor();
+    req.onsuccess = (e)=>{
+      const cursor = e.target.result;
+      if(cursor){ onChunk(cursor.value); cursor.continue(); }
+    };
+    tx.oncomplete = ()=>res(true);
+    tx.onerror = e=>rej(dbErr(e,'Failed reading stored data'));
   });
 }
 async function idbEstimateStorage(){
@@ -2854,7 +2876,8 @@ async function renderImportHistory(){
   const foot = document.getElementById('importHistoryFoot');
   const storageTxt = est ? (est.usage/1024/1024).toFixed(1)+' MB used' : 'Storage info unavailable';
   const lastImport = hist.length ? new Date(hist[0].date).toLocaleString() : '—';
-  foot.innerHTML = `<span>Total Records: <b>${state.rows.length.toLocaleString()}</b></span><span>Storage Used: <b>${storageTxt}</b></span><span>Last Imported: <b>${lastImport}</b></span>`;
+  const totalRecordsLabel = (state.largeDatasetMode ? state.knownTotalRowCount : state.rows.length).toLocaleString() + (state.largeDatasetMode ? ' (Summary Mode)' : '');
+  foot.innerHTML = `<span>Total Records: <b>${totalRecordsLabel}</b></span><span>Storage Used: <b>${storageTxt}</b></span><span>Last Imported: <b>${lastImport}</b></span>`;
 }
 async function clearImportHistory(){
   if(!confirm('صرف Import Log صاف ہو گا، آپ کا موجودہ ڈیٹا محفوظ رہے گا۔ جاری رکھیں؟')) return;
@@ -2879,7 +2902,7 @@ async function renderImportManager(){
   const successCount = hist.filter(h=>h.status==='Success').length;
   [
     {label:'Imported Files', value:String(successCount), icon:'report', color:'var(--accent-grad)'},
-    {label:'Total Records', value: state.rows.length.toLocaleString(), icon:'grid', color:'linear-gradient(135deg,#3b82f6,#1e3a8a)'},
+    {label:'Total Records', value: (state.largeDatasetMode ? state.knownTotalRowCount : state.rows.length).toLocaleString() + (state.largeDatasetMode?' (Summary)':''), icon:'grid', color:'linear-gradient(135deg,#3b82f6,#1e3a8a)'},
     {label:'Storage Used', value: est? (est.usage/1024/1024).toFixed(1)+' MB' : '—', icon:'layers', color:'linear-gradient(135deg,#8b5cf6,#5b21b6)'},
     {label:'Last Import', value: hist.length? new Date(hist[0].date).toLocaleDateString() : '—', icon:'calendar', color:'linear-gradient(135deg,#f59e0b,#b45309)'},
   ].forEach(k=>{
@@ -2929,20 +2952,53 @@ async function removeImportBatches(historyIds){
   const importIdsToRemove = new Set(toRemove.map(h=>h.importId).filter(Boolean));
 
   if(importIdsToRemove.size){
-    state.rows = state.rows.filter(r=> !importIdsToRemove.has(r.__importId));
-    dataGeneration++;
-    state.summaryAgg = new Map();
-    for(let i=0;i<state.rows.length;i++) addToSummary(state.summaryAgg, state.rows[i]);
-    await safeIdb(()=>idbSetMeta('summaryAgg', [...state.summaryAgg.entries()]));
-    await safeIdb(()=>idbSetMeta('totalRowCount', state.rows.length));
+    if(state.largeDatasetMode){
+      // Memory-safe path: never load all rows at once — stream through stored chunks
+      // one at a time, filtering out the deleted import(s) and rebuilding the summary
+      // as we go, then rewrite only what's kept.
+      const newSummary = new Map();
+      const keepChunks = [];
+      let newTotal = 0;
+      await idbForEachChunk(chunk=>{
+        const kept = chunk.rows.filter(r=> !importIdsToRemove.has(r.__importId));
+        newTotal += kept.length;
+        for(let i=0;i<kept.length;i++) addToSummary(newSummary, kept[i]);
+        if(kept.length) keepChunks.push({ id: chunk.id, rows: kept });
+      });
+      await idbClearChunks();
+      if(keepChunks.length) await idbPutChunksBulk(keepChunks);
+      state.summaryAgg = newSummary;
+      state.knownTotalRowCount = newTotal;
+      dataGeneration++;
+      await safeIdb(()=>idbSetMeta('summaryAgg', [...state.summaryAgg.entries()]));
+      await safeIdb(()=>idbSetMeta('totalRowCount', newTotal));
+      await safeIdb(()=>idbSetMeta('hasData', newTotal>0));
+      if(newTotal <= LARGE_DATASET_ROW_THRESHOLD){
+        // back under the safe limit — restore full row-level functionality (Table, Employee/Branch reports)
+        state.largeDatasetMode = false;
+        let all = [];
+        const chunks = await idbGetAllChunks();
+        chunks.forEach(c=> all = all.concat(c.rows));
+        state.rows = all;
+      } else {
+        state.rows = [];
+      }
+    } else {
+      state.rows = state.rows.filter(r=> !importIdsToRemove.has(r.__importId));
+      dataGeneration++;
+      state.summaryAgg = new Map();
+      for(let i=0;i<state.rows.length;i++) addToSummary(state.summaryAgg, state.rows[i]);
+      await safeIdb(()=>idbSetMeta('summaryAgg', [...state.summaryAgg.entries()]));
+      await safeIdb(()=>idbSetMeta('totalRowCount', state.rows.length));
+      await idbClearChunks();
+      const SAVE_CHUNK = 5000;
+      const chunks = [];
+      const stamp = Date.now();
+      for(let i=0;i<state.rows.length;i+=SAVE_CHUNK){ chunks.push({id:'chunk_'+stamp+'_'+Math.floor(i/SAVE_CHUNK), rows: state.rows.slice(i,i+SAVE_CHUNK)}); }
+      if(chunks.length) await idbPutChunksBulk(chunks);
+      await idbSetMeta('hasData', state.rows.length>0);
+    }
     schedulePrewarmRiskCache(); // kick off a background Risk recompute now, before the user asks for it
-    await idbClearChunks();
-    const SAVE_CHUNK = 5000;
-    const chunks = [];
-    const stamp = Date.now();
-    for(let i=0;i<state.rows.length;i+=SAVE_CHUNK){ chunks.push({id:'chunk_'+stamp+'_'+Math.floor(i/SAVE_CHUNK), rows: state.rows.slice(i,i+SAVE_CHUNK)}); }
-    if(chunks.length) await idbPutChunksBulk(chunks);
-    await idbSetMeta('hasData', state.rows.length>0);
   }
 
   const newHist = hist.filter(h=> !historyIds.includes(h.historyId));
@@ -3117,11 +3173,11 @@ function normalizeRow(row){
 // browser, and new Date('01/12/2025') silently misparses as MM/DD (Jan 12, not Dec 1) —
 // so dates must be parsed explicitly, not handed to the Date constructor as-is.
 function parseDMY(s){
-  if(s==null || s==='') return null;
-  if(s instanceof Date) return isNaN(s) ? null : s;
+  if(s==null || s==='') return undefined;
+  if(s instanceof Date) return isNaN(s) ? undefined : s;
   const m = String(s).trim().match(/^(\\d{1,2})\\/(\\d{1,2})\\/(\\d{4})$/);
-  if(m){ const d = new Date(+m[3], +m[2]-1, +m[1]); return isNaN(d) ? null : d; }
-  const d = new Date(s); return isNaN(d) ? null : d;
+  if(m){ const d = new Date(+m[3], +m[2]-1, +m[1]); return isNaN(d) ? undefined : d; }
+  const d = new Date(s); return isNaN(d) ? undefined : d;
 }
 
 self.onmessage = function(e){
@@ -5334,7 +5390,6 @@ async function autoRestore(){
       // and District/Division/Purpose/Box Type/Status/Department reports all run from the
       // summary and stay fully functional; Table view and Employee/Branch reports (which
       // genuinely need raw rows) are the known gap until on-demand loading is built.
-      const LARGE_DATASET_ROW_THRESHOLD = 800000;
       const knownTotal = await idbGetMeta('totalRowCount');
 
       if(typeof knownTotal==='number' && knownTotal > LARGE_DATASET_ROW_THRESHOLD){
@@ -6554,7 +6609,7 @@ async function restoreBackup(){
       // `instanceof Date` display/formatting code downstream keeps working exactly as before.
       state.rows.forEach(r=>{
         const v = r[COL.DATE];
-        if(v && !(v instanceof Date)){ const d = new Date(v); r[COL.DATE] = isNaN(d) ? null : d; }
+        if(v && !(v instanceof Date)){ const d = new Date(v); r[COL.DATE] = isNaN(d) ? undefined : d; }
       });
       if(parsed.settings) state.settings = { ...DEFAULT_SETTINGS, ...parsed.settings };
       state.filterSel = parsed.filters || {};
