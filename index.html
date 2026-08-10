@@ -3380,7 +3380,9 @@ async function ingestOneFileStreaming(file, fileIdx, fileCount, base, span, ctx)
         }
         if(!row[COL.DATE] || row[COL.DIVISION]===''){ ctx.missingCount++; }
         row.__importId = importId;
-        ctx.newRows.push(row);
+        ctx.runningTotal++;
+        if(ctx.runningTotal <= LARGE_DATASET_ROW_THRESHOLD){ ctx.newRows.push(row); }
+        else if(ctx.newRows.length){ ctx.newRows.length = 0; ctx.wentLarge = true; } // crossed the line mid-file — drop what's already collected, IndexedDB already has it
         ctx.pendingSave.push(row);
         addToSummary(ctx.summaryDelta, row);
       });
@@ -3438,7 +3440,9 @@ async function ingestOneFileStreaming(file, fileIdx, fileCount, base, span, ctx)
               }
               if(!row[COL.DATE] || row[COL.DIVISION]===''){ ctx.missingCount++; }
               row.__importId = importId;
-              ctx.newRows.push(row);
+              ctx.runningTotal++;
+              if(ctx.runningTotal <= LARGE_DATASET_ROW_THRESHOLD){ ctx.newRows.push(row); }
+              else if(ctx.newRows.length){ ctx.newRows.length = 0; ctx.wentLarge = true; }
               ctx.pendingSave.push(row);
               addToSummary(ctx.summaryDelta, row);
             });
@@ -3480,7 +3484,9 @@ async function ingestOneFileStreaming(file, fileIdx, fileCount, base, span, ctx)
           }
           if(!row[COL.DATE] || row[COL.DIVISION]===''){ ctx.missingCount++; }
           row.__importId = importId;
-          ctx.newRows.push(row);
+          ctx.runningTotal++;
+          if(ctx.runningTotal <= LARGE_DATASET_ROW_THRESHOLD){ ctx.newRows.push(row); }
+          else if(ctx.newRows.length){ ctx.newRows.length = 0; ctx.wentLarge = true; }
           ctx.pendingSave.push(row);
           addToSummary(ctx.summaryDelta, row);
         });
@@ -3521,6 +3527,8 @@ async function startImport(){
       // same as before.
       dupCheck: new Set(state.rows.filter(r=>r[COL.SNO]!==undefined && r[COL.SNO]!=='').map(duplicateKeyOf)),
       summaryDelta: new Map(), // this import's contribution to the additive summary — merged into state.summaryAgg once the import finishes
+      runningTotal: state.rows.length, // memory-safety counter — see LARGE_DATASET_ROW_THRESHOLD checks in onBatch below
+      wentLarge: false,
       dupCount: 0, missingCount: 0,
       flushSave: null
     };
@@ -3549,7 +3557,16 @@ async function startImport(){
     await ctx.flushSave(true);
 
     const newRows = ctx.newRows;
-    state.rows = state.importMode==='replace' ? newRows : state.rows.concat(newRows);
+    if(ctx.wentLarge){
+      state.rows = []; // newRows was intentionally emptied mid-import to stay memory-safe — see LARGE_DATASET_ROW_THRESHOLD
+      state.largeDatasetMode = true;
+      state.knownTotalRowCount = ctx.runningTotal;
+    } else {
+      state.rows = state.importMode==='replace' ? newRows : state.rows.concat(newRows);
+      if(state.largeDatasetMode && state.rows.length <= LARGE_DATASET_ROW_THRESHOLD){
+        state.largeDatasetMode = false; // dropped back under the safe limit (e.g. after deleting old imports then adding a small one)
+      }
+    }
     dataGeneration++;
     if(state.importMode==='replace' || !state.summaryAgg) state.summaryAgg = new Map();
     ctx.summaryDelta.forEach((v,k)=>{
@@ -3557,10 +3574,11 @@ async function startImport(){
       if(!e){ e = {count:0, sumAmount:0, sumDiffAmt:0}; state.summaryAgg.set(k, e); }
       e.count += v.count; e.sumAmount += v.sumAmount; e.sumDiffAmt += v.sumDiffAmt;
     });
+    const trueRowCount = ctx.wentLarge ? ctx.runningTotal : state.rows.length;
     await safeIdb(()=>idbSetMeta('summaryAgg', [...state.summaryAgg.entries()]));
-    await safeIdb(()=>idbSetMeta('totalRowCount', state.rows.length));
+    await safeIdb(()=>idbSetMeta('totalRowCount', trueRowCount));
     schedulePrewarmRiskCache(); // kick off a background Risk recompute now, before the user asks for it
-    await safeIdb(()=>idbSetMeta('lastImport', {fileNames:files.map(f=>f.name), rowCount:state.rows.length, date:new Date().toISOString()}));
+    await safeIdb(()=>idbSetMeta('lastImport', {fileNames:files.map(f=>f.name), rowCount:trueRowCount, date:new Date().toISOString()}));
     await safeIdb(()=>idbSetMeta('hasData', true));
 
     // record one history entry per successfully imported file (with importId for deletion)
@@ -3569,16 +3587,17 @@ async function startImport(){
     }
 
     setProgress(100,'Import complete');
-    logImport('🎉 Import successful — '+newRows.length.toLocaleString()+' rows saved from '+fileCount+' file'+(fileCount>1?'s':''));
+    const importedCountLabel = (ctx.wentLarge ? ctx.runningTotal : newRows.length).toLocaleString();
+    logImport('🎉 Import successful — '+importedCountLabel+' rows saved from '+fileCount+' file'+(fileCount>1?'s':''));
 
     document.getElementById('summaryGrid').style.display='grid';
     document.getElementById('summaryGrid').innerHTML = `
-      <div class="summary-box"><div class="n">${newRows.length.toLocaleString()}</div><div class="l">Rows Imported</div></div>
+      <div class="summary-box"><div class="n">${importedCountLabel}</div><div class="l">Rows Imported</div></div>
       <div class="summary-box"><div class="n">${fileCount}</div><div class="l">Files Processed</div></div>
       <div class="summary-box"><div class="n">${ctx.dupCount}</div><div class="l">Duplicates</div></div>`;
 
     if(idbAvailable){
-      toast('success','Import Successful — امپورٹ کامیاب', newRows.length.toLocaleString()+' rows، '+fileCount+' فائلوں سے اسٹور ہو گئیں');
+      toast('success','Import Successful — امپورٹ کامیاب', importedCountLabel+' rows، '+fileCount+' فائلوں سے اسٹور ہو گئیں');
     } else {
       toast('success','Import Loaded (Memory Only) — امپورٹ لوڈ ہو گیا (میموری میں)', newRows.length.toLocaleString()+' rows دستیاب ہیں، مگر ری لوڈ پر ضائع ہو جائیں گی — اسٹوریج کا مسئلہ اوپر بیان ہوا');
     }
