@@ -6,11 +6,41 @@
 <title>Collection Analytics Dashboard</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Noto+Nastaliq+Urdu:wght@400;600;700&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/echarts/5.4.3/echarts.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.1/jspdf.plugin.autotable.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/echarts/5.4.3/echarts.min.js" onerror="window.__libLoadFailed=(window.__libLoadFailed||[]).concat('echarts')"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" onerror="window.__libLoadFailed=(window.__libLoadFailed||[]).concat('xlsx')"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js" onerror="window.__libLoadFailed=(window.__libLoadFailed||[]).concat('papaparse')"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js" onerror="window.__libLoadFailed=(window.__libLoadFailed||[]).concat('jspdf')"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.1/jspdf.plugin.autotable.min.js" onerror="window.__libLoadFailed=(window.__libLoadFailed||[]).concat('jspdf-autotable')"></script>
+<script>
+// Makes failures VISIBLE instead of a silently blank report — a slow/unreliable
+// connection (mobile networks especially) failing to load one CDN library is the
+// most likely reason this dashboard "works on some systems, not others" with
+// uploads succeeding but reports staying empty. Runs before anything else so it
+// catches both script-load failures above and any later runtime error.
+(function(){
+  function showFatalBanner(msg){
+    if(document.getElementById('__fatalErrBanner')) return; // one at a time
+    var d = document.createElement('div');
+    d.id = '__fatalErrBanner';
+    d.style.cssText = 'position:fixed; top:0; left:0; right:0; z-index:99999; background:#fee2e2; color:#7f1d1d; padding:12px 16px; font:600 13px/1.5 sans-serif; border-bottom:2px solid #ef4444; direction:rtl; text-align:right;';
+    d.innerHTML = '⚠️ ایک خرابی ہوئی — یہ صفحہ ری لوڈ (reload) کریں۔ اگر مسئلہ برقرار رہے تو انٹرنیٹ کنکشن چیک کریں۔<br><span style="font-weight:400; font-size:11px; direction:ltr; display:block; margin-top:4px;">'+msg+'</span>'
+      + '<button onclick="location.reload()" style="margin-top:6px; padding:4px 14px; border-radius:6px; border:1px solid #ef4444; background:#fff; color:#7f1d1d; font-weight:700; cursor:pointer;">Reload</button>'
+      + '<button onclick="this.parentElement.remove()" style="margin-top:6px; margin-right:6px; padding:4px 14px; border-radius:6px; border:1px solid #d1d5db; background:#fff; color:#374151; cursor:pointer;">Dismiss</button>';
+    document.body ? document.body.prepend(d) : window.addEventListener('DOMContentLoaded', ()=>document.body.prepend(d));
+  }
+  window.addEventListener('load', function(){
+    if(window.__libLoadFailed && window.__libLoadFailed.length){
+      showFatalBanner('Failed to load: '+window.__libLoadFailed.join(', ')+' — a required library could not be downloaded (check your internet connection).');
+    }
+  });
+  window.addEventListener('error', function(e){
+    showFatalBanner((e && e.message) || 'Unknown script error');
+  });
+  window.addEventListener('unhandledrejection', function(e){
+    showFatalBanner('Promise error: '+((e.reason && e.reason.message) || e.reason || 'Unknown'));
+  });
+})();
+</script>
 <style>
 /* ============================================================
    DESIGN TOKENS
@@ -2049,7 +2079,8 @@ table.dg thead th.col-hidden, table.dg tbody td.col-hidden{ display:none; }
 <div class="slide-panel-overlay narrow-ov" id="rmBoxHistOverlay" onclick="if(event.target===this) closeBoxHistory()">
   <div class="slide-panel narrow" id="rmBoxHistPanel">
     <div class="slide-panel-head">
-      <div><h2 id="rmBoxHistTitle">Box History</h2><div class="sub" id="rmBoxHistSub"></div></div>
+      <div><h2 id="rmBoxHistTitle">Box History</h2><div class="sub" id="rmBoxHistSub"></div><div class="sub" id="rmBoxHistTotal" style="font-weight:800; margin-top:2px;"></div></div>
+      <button class="btn-ghost" id="rmBoxHistExportBtn" style="margin-right:8px;" onclick="exportBoxHistoryToExcel()">⬇ Export Excel</button>
       <button class="slide-panel-close" onclick="closeBoxHistory()">✕</button>
     </div>
     <div class="slide-panel-body" id="rmBoxHistBody"></div>
@@ -3382,7 +3413,7 @@ async function ingestOneFileStreaming(file, fileIdx, fileCount, base, span, ctx)
         row.__importId = importId;
         ctx.runningTotal++;
         if(ctx.runningTotal <= LARGE_DATASET_ROW_THRESHOLD){ ctx.newRows.push(row); }
-        else if(ctx.newRows.length){ ctx.newRows.length = 0; ctx.wentLarge = true; } // crossed the line mid-file — drop what's already collected, IndexedDB already has it
+        else if(ctx.newRows.length && idbAvailable){ ctx.newRows.length = 0; ctx.wentLarge = true; } // only drop the in-memory copy if IndexedDB actually has it — otherwise this would be the only copy, and clearing it would silently destroy data
         ctx.pendingSave.push(row);
         addToSummary(ctx.summaryDelta, row);
       });
@@ -3442,7 +3473,7 @@ async function ingestOneFileStreaming(file, fileIdx, fileCount, base, span, ctx)
               row.__importId = importId;
               ctx.runningTotal++;
               if(ctx.runningTotal <= LARGE_DATASET_ROW_THRESHOLD){ ctx.newRows.push(row); }
-              else if(ctx.newRows.length){ ctx.newRows.length = 0; ctx.wentLarge = true; }
+              else if(ctx.newRows.length && idbAvailable){ ctx.newRows.length = 0; ctx.wentLarge = true; } // only drop the in-memory copy if IndexedDB actually has it — otherwise this would be the only copy, and clearing it would silently destroy data
               ctx.pendingSave.push(row);
               addToSummary(ctx.summaryDelta, row);
             });
@@ -3486,7 +3517,7 @@ async function ingestOneFileStreaming(file, fileIdx, fileCount, base, span, ctx)
           row.__importId = importId;
           ctx.runningTotal++;
           if(ctx.runningTotal <= LARGE_DATASET_ROW_THRESHOLD){ ctx.newRows.push(row); }
-          else if(ctx.newRows.length){ ctx.newRows.length = 0; ctx.wentLarge = true; }
+          else if(ctx.newRows.length && idbAvailable){ ctx.newRows.length = 0; ctx.wentLarge = true; } // only drop the in-memory copy if IndexedDB actually has it — otherwise this would be the only copy, and clearing it would silently destroy data
           ctx.pendingSave.push(row);
           addToSummary(ctx.summaryDelta, row);
         });
@@ -4924,7 +4955,8 @@ document.getElementById('filterBarReset').addEventListener('click', ()=>{
   state.active = state.rows;
   state.table.page = 1;
   refreshActivePage();
-  document.getElementById('phaseState').textContent = state.rows.length.toLocaleString()+' / '+state.rows.length.toLocaleString()+' Rows';
+  const totalLabel2 = (state.largeDatasetMode ? state.knownTotalRowCount : state.rows.length).toLocaleString() + (state.largeDatasetMode?' (Summary Mode)':'');
+  document.getElementById('phaseState').textContent = totalLabel2+' / '+totalLabel2+' Rows';
   idbSetMeta('lastFilterSel', state.filterSel);
   toast('success','Filters Reset — ری سیٹ مکمل', 'تمام ڈیٹا دوبارہ دکھایا جا رہا ہے');
 });
@@ -5530,14 +5562,14 @@ const COL_TO_SUMMARY_DIM = {
 // Reports all render through renderAnalysisPage) computed from the summary instead of scanning
 // every raw row. Returns null when dimCol isn't a summary-tracked dimension (Employee/Branch),
 // so callers fall back to the exact original raw-row computation unchanged.
-function computeMatrixFromSummary(dimCol, monthsToShow){
+function computeMatrixFromSummary(dimCol, monthsToShow, filterSelOverride){
   const dimKey = COL_TO_SUMMARY_DIM[dimCol];
   if(!dimKey) return null;
   const dimIdx = SUMMARY_DIMS.indexOf(dimKey);
   const monthIdx = SUMMARY_DIMS.indexOf('Month');
   const statusIdx = SUMMARY_DIMS.indexOf('Status');
   const monthNumByName = {}; for(let i=1;i<=12;i++) monthNumByName[SUMMARY_MONTH_NAMES[i]] = i;
-  const filterSel = state.filterSel;
+  const filterSel = filterSelOverride || state.filterSel;
 
   // Pass 1: every distinct dim value present under the current filter (any month) —
   // matches uniqueVals(state.active, dimCol) semantics exactly.
@@ -5573,13 +5605,15 @@ function computeMatrixFromSummary(dimCol, monthsToShow){
 }
 function renderAnalysisPage(dimCol, label){
   currentAnalysisDim = dimCol; currentAnalysisDimLabel = label;
-  const rows = state.active.length || state.filterSel && Object.keys(state.filterSel).length ? state.active : state.rows;
+  const isStatusReport = dimCol===COL.STATUS;
+  const rows = isStatusReport ? state.rows : ((state.active.length || state.filterSel && Object.keys(state.filterSel).length) ? state.active : state.rows);
   document.getElementById('analysisTitle').textContent = label;
-  document.getElementById('analysisTableTitle').textContent = label+' — Dimension × Month Matrix';
+  document.getElementById('analysisTableTitle').textContent = label+' — Dimension × Month Matrix'+(isStatusReport?' (تمام ڈیٹا — فلٹرز لاگو نہیں)':'');
 
   const monthsToShow = selectedMonthNumbers() || [1,2,3,4,5,6,7,8,9,10,11,12];
-  const useSummary = canUseSummaryForCurrentFilters() && !!COL_TO_SUMMARY_DIM[dimCol];
-  const summaryResult = useSummary ? computeMatrixFromSummary(dimCol, monthsToShow) : null;
+  const effectiveFilterSel = isStatusReport ? {} : state.filterSel;
+  const useSummary = (isStatusReport ? !!state.summaryAgg : canUseSummaryForCurrentFilters()) && !!COL_TO_SUMMARY_DIM[dimCol];
+  const summaryResult = useSummary ? computeMatrixFromSummary(dimCol, monthsToShow, effectiveFilterSel) : null;
 
   let matrixData, overall, capResult;
   if(summaryResult){
@@ -5633,8 +5667,21 @@ function renderAnalysisPage(dimCol, label){
   let currentAnalysisMetric = COL.AMOUNT;
   let currentAnalysisQuickFilter = 'all';
   function refresh(){
-    renderMetricButtons('analysisMetricBtns', currentAnalysisMetric, (m)=>{ currentAnalysisMetric=m; refresh(); });
-    renderQuickFilterButtons('analysisQuickFilterBtns', currentAnalysisQuickFilter, (f)=>{ currentAnalysisQuickFilter=f; refresh(); });
+    const metricBtnsEl = document.getElementById('analysisMetricBtns');
+    const quickFilterBtnsEl = document.getElementById('analysisQuickFilterBtns');
+    if(isStatusReport){
+      // Status Report's rows already ARE the statuses (Normal/Closed/Empty/...) — an
+      // Amount/Open/Closed/Empty "metric" selector on top of that is redundant and
+      // confusing, so it's hidden here and the metric stays fixed at Amount.
+      metricBtnsEl.style.display = 'none';
+      quickFilterBtnsEl.style.display = 'none';
+      currentAnalysisMetric = COL.AMOUNT;
+    } else {
+      metricBtnsEl.style.display = '';
+      quickFilterBtnsEl.style.display = '';
+      renderMetricButtons('analysisMetricBtns', currentAnalysisMetric, (m)=>{ currentAnalysisMetric=m; refresh(); });
+      renderQuickFilterButtons('analysisQuickFilterBtns', currentAnalysisQuickFilter, (f)=>{ currentAnalysisQuickFilter=f; refresh(); });
+    }
     document.getElementById('analysisChartTitle').textContent = label+' — Ranking by '+currentAnalysisMetric;
     document.getElementById('analysisChartSub').textContent = 'By '+currentAnalysisMetric;
 
@@ -6645,26 +6692,33 @@ async function createBackup(){
   try{
     const importHistory = (await idbGetMeta('importHistory')) || [];
     const lastImport = await idbGetMeta('lastImport');
-    if(state.rows.length>50000) toast('success','Preparing Backup — بیک اپ تیار ہو رہا ہے', state.rows.length.toLocaleString()+' rows، تھوڑا انتظار کریں...');
+    const totalForMessage = state.largeDatasetMode ? state.knownTotalRowCount : state.rows.length;
+    if(totalForMessage>50000) toast('success','Preparing Backup — بیک اپ تیار ہو رہا ہے', totalForMessage.toLocaleString()+' rows، تھوڑا انتظار کریں...');
 
     // Build JSON as an array of string parts instead of one JSON.stringify(hugeArray) call.
     // At 2M+ rows that single call can exceed the JS engine's max string length (~800MB+ of
     // text here) and throw — and since this was never wrapped in try/catch, that failure was
     // completely silent, which is exactly what "Backup button doesn't work" looks like.
+    //
+    // Streams chunks directly from IndexedDB (idbForEachChunk) rather than from state.rows —
+    // state.rows is deliberately empty in large-dataset mode, so reading from it would have
+    // silently produced an EMPTY backup file while still showing "Backup Created successfully".
+    // This way the backup is always complete regardless of whether rows are loaded in memory.
     const parts = ['{"rows":['];
-    const CHUNK = 20000;
-    for(let i=0;i<state.rows.length;i+=CHUNK){
-      const slice = state.rows.slice(i, i+CHUNK);
-      let s = JSON.stringify(slice).slice(1,-1); // strip outer [ ]
-      if(i+CHUNK<state.rows.length) s += ',';
+    let rowCount = 0, firstChunk = true;
+    await idbForEachChunk(chunk=>{
+      let s = JSON.stringify(chunk.rows).slice(1,-1); // strip outer [ ]
+      if(!s) return;
+      if(!firstChunk) parts.push(',');
       parts.push(s);
-      if(i+CHUNK<state.rows.length) await idleYield();
-    }
+      firstChunk = false;
+      rowCount += chunk.rows.length;
+    });
     parts.push('],"settings":'+JSON.stringify(state.settings)
       +',"filters":'+JSON.stringify(state.filterSel)
       +',"metadata":'+JSON.stringify({importHistory, lastImport})
       +',"exportedAt":"'+new Date().toISOString()+'"'
-      +',"rowCount":'+state.rows.length+'}');
+      +',"rowCount":'+rowCount+'}');
 
     const blob = new Blob(parts, {type:'application/json'});
     const url = URL.createObjectURL(blob);
@@ -6674,7 +6728,7 @@ async function createBackup(){
     a.click();
     document.body.removeChild(a);
     setTimeout(()=> URL.revokeObjectURL(url), 10000);
-    toast('success','Backup Created — بیک اپ بن گیا', state.rows.length.toLocaleString()+' rows شامل ہیں');
+    toast('success','Backup Created — بیک اپ بن گیا', rowCount.toLocaleString()+' rows شامل ہیں');
   }catch(err){
     console.error('Backup failed:', err);
     toast('error','Backup Failed — بیک اپ ناکام', (err && err.message) ? err.message : 'نامعلوم خرابی — ڈیٹا بہت بڑا ہو سکتا ہے');
@@ -6714,10 +6768,27 @@ async function restoreBackup(){
         if(parsed.metadata.importHistory) await idbSetMeta('importHistory', parsed.metadata.importHistory);
         if(parsed.metadata.lastImport) await idbSetMeta('lastImport', parsed.metadata.lastImport);
       }
+      // Rebuild the summary from the restored data — without this, KPIs/reports would
+      // keep showing whatever summary existed BEFORE the restore, completely out of
+      // sync with the data that was just loaded.
+      state.summaryAgg = new Map();
+      for(let i=0;i<state.rows.length;i++) addToSummary(state.summaryAgg, state.rows[i]);
+      await safeIdb(()=>idbSetMeta('summaryAgg', [...state.summaryAgg.entries()]));
+      await safeIdb(()=>idbSetMeta('totalRowCount', state.rows.length));
+      const restoredRowCount = state.rows.length;
+      if(state.rows.length > LARGE_DATASET_ROW_THRESHOLD){
+        // Same memory-safety switch used by autoRestore/import — chunks are already
+        // safely written above, so it's safe to free the in-memory copy now.
+        state.largeDatasetMode = true;
+        state.knownTotalRowCount = state.rows.length;
+        state.rows = [];
+      } else {
+        state.largeDatasetMode = false;
+      }
       applySettingsToUI();
       buildDashboard(true); // preserveFilters=true — restored filter selections should apply immediately
       renderImportHistory();
-      toast('success','Restore Complete — بحالی مکمل', state.rows.length.toLocaleString()+' rows بحال ہو گئیں'+(repairedRowCount>0?(' — '+repairedRowCount.toLocaleString()+' codes repaired'):''));
+      toast('success','Restore Complete — بحالی مکمل', restoredRowCount.toLocaleString()+' rows بحال ہو گئیں'+(repairedRowCount>0?(' — '+repairedRowCount.toLocaleString()+' codes repaired'):''));
     }catch(err){ toast('error','Restore Failed — بحالی ناکام', (err && err.message) ? err.message : 'فائل خراب ہے'); }
   };
   reader.readAsText(file);
@@ -6728,6 +6799,11 @@ async function resetAllData(){
   await idbClearChunks();
   await idbSetMeta('hasData', false);
   state.rows = [];
+  state.summaryAgg = new Map();
+  state.largeDatasetMode = false;
+  state.knownTotalRowCount = 0;
+  await safeIdb(()=>idbSetMeta('summaryAgg', []));
+  await safeIdb(()=>idbSetMeta('totalRowCount', 0));
   dataGeneration++;
   schedulePrewarmRiskCache(); // kick off a background Risk recompute now, before the user asks for it
   buildDashboard();
@@ -8157,6 +8233,19 @@ function riskRelevantMonths(box, mod){
   if(firstRiskIdx===-1) return sorted; // never inactive — nothing to trim (guard; shouldn't happen for a box that IS in the Inactive risk list)
   return sorted.slice(firstRiskIdx);
 }
+let currentBoxHistoryExport = null; // {rows, filename} for the Export Excel button — set fresh each time a box history modal renders
+function exportGenericToExcel(rows, filename, sheetName){
+  if(!rows.length){ toast('error','Nothing to Export','کوئی ڈیٹا موجود نہیں'); return; }
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, sheetName||'Data');
+  XLSX.writeFile(wb, filename+'_'+new Date().toISOString().slice(0,10)+'.xlsx');
+  toast('success','Export Complete — ایکسپورٹ مکمل', rows.length.toLocaleString()+' rows exported');
+}
+function exportBoxHistoryToExcel(){
+  if(!currentBoxHistoryExport || !currentBoxHistoryExport.rows.length){ toast('error','Nothing to Export','کوئی ڈیٹا موجود نہیں'); return; }
+  exportGenericToExcel(currentBoxHistoryExport.rows, currentBoxHistoryExport.filename, 'Box History');
+}
 function renderBoxHistoryModal(box, subLabel, badgeHtml, mod){
   document.getElementById('rmBoxHistTitle').textContent = 'Box '+box.code;
   document.getElementById('rmBoxHistSub').innerHTML = escHtmlRM((box.shop?box.shop+' · ':'') + subLabel) + (badgeHtml||'');
@@ -8166,6 +8255,16 @@ function renderBoxHistoryModal(box, subLabel, badgeHtml, mod){
   const hiddenNote = hiddenCount>0
     ? `<div class="sub" style="margin-bottom:8px;">Showing risk-relevant months only — ${hiddenCount} unrelated normal-collection month${hiddenCount===1?'':'s'} hidden.</div>` : '';
   const donorRows = rowsSorted.filter(m=>m.donor);
+  // Total amount actually collected by THIS box across the selected duration window
+  // (6/12/24 months etc., set by the Duration control) — always the FULL window,
+  // not just the risk-relevant rows shown below, so it answers "how much came in
+  // over this whole period" regardless of which months got filtered out above.
+  const periodTotal = allSorted.reduce((s,m)=>s+(m.amount||0),0);
+  document.getElementById('rmBoxHistTotal').textContent = 'Total Amount (selected period): PKR '+Math.round(periodTotal).toLocaleString()+' — '+allSorted.length+' months';
+  currentBoxHistoryExport = {
+    filename: 'Box_'+box.code+'_History',
+    rows: rowsSorted.map(m=>({ Month: ymLabel(m.key), Status: m.status||'', Purpose: m.purpose||'', Amount: Math.round(m.amount||0), 'Shop Name': m.shop||'', Employee: m.employee||'', Branch: m.branch||'', 'Donor Name': m.donor||'' }))
+  };
   // Donor Name is an optional secondary detail (not every import has it) and is
   // never shown by default — kept collapsed behind a native <details> toggle so
   // it can't clutter the primary risk view, per spec.
@@ -8193,6 +8292,12 @@ function ymd(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0
 function renderPurposeTimelineModal(box, subLabel, badgeHtml, dateTimeline){
   document.getElementById('rmBoxHistTitle').textContent = 'Box '+box.code+' — Purpose Timeline';
   document.getElementById('rmBoxHistSub').innerHTML = escHtmlRM((box.shop?box.shop+' · ':'') + subLabel) + (badgeHtml||'');
+  const periodTotal = (dateTimeline||[]).reduce((s,g)=>s+(g.amount||0),0);
+  document.getElementById('rmBoxHistTotal').textContent = 'Total Amount (selected period): PKR '+Math.round(periodTotal).toLocaleString()+' — '+(dateTimeline||[]).length+' entries';
+  currentBoxHistoryExport = {
+    filename: 'Box_'+box.code+'_PurposeTimeline',
+    rows: (dateTimeline||[]).map(g=>({ Date: ymd(g.date), 'Purpose(s)': g.purposes.join(' + '), Amount: Math.round(g.amount||0), 'Purpose Shift': g.isChange?'Yes':'' }))
+  };
   const rowsHtml = (dateTimeline||[]).map(g=>
     `<tr class="${g.isChange?'purpose-shift-row':''}"><td>${ymd(g.date)}</td><td>${escHtmlRM(g.purposes.join(' + '))}</td>
       <td>PKR ${Math.round(g.amount).toLocaleString()}</td>
@@ -8849,11 +8954,18 @@ function aiBuildContext(scope, full){
     scope,
     full: !!full,
     generatedAt: new Date().toISOString(),
-    totalRowsInDashboard: allRows.length,
+    totalRowsInDashboard: state.largeDatasetMode ? state.knownTotalRowCount : allRows.length,
     rowsInCurrentScope: 0,
     activeFilters: aiActiveFilterSummary(),
     currentPage: (document.querySelector('.page.active')||{}).id || 'unknown'
   };
+  if(state.largeDatasetMode && (scope==='all' || scope==='page')){
+    // Raw-row aggregation (district/branch/employee/purpose breakdowns) isn't available in
+    // large-dataset mode — telling the AI this explicitly prevents it from confidently
+    // answering with wrong numbers derived from an empty row set.
+    base.note = 'DATASET TOO LARGE FOR ROW-LEVEL AI ANALYSIS: '+state.knownTotalRowCount.toLocaleString()+' rows are stored, but this scope needs raw-row detail (district/branch/employee/purpose breakdowns) that is not available in Summary Mode. KPI cards and District/Division/Purpose/Box Type/Status/Department Reports still show correct totals from the dashboard summary — direct the user there for those numbers. Do not fabricate district/branch/employee figures for this scope.';
+    return base;
+  }
   if(scope==='all'){
     const rows = allRows;
     base.rowsInCurrentScope = rows.length;
