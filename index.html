@@ -4895,14 +4895,148 @@ function refreshActivePage(){
   }
 }
 
+/* ============================================================
+   LARGE-DATASET FILTERED LOAD
+   In Summary Mode (dataset above LARGE_DATASET_ROW_THRESHOLD) raw rows are never held in
+   memory, so row-level pages (Employee/Branch reports, Yearly, Comparison, Employee Monthly/
+   Yearly, the whole Risk Monitor) had nothing to read. When the user clicks Apply Filters we
+   now stream the stored chunks ONE AT A TIME out of IndexedDB, keep only rows matching the
+   current filters, and put them in state.active -- every page above already reads state.active,
+   so they all work on that filtered subset with their existing, unchanged logic.
+   If the filter still matches more than the cap, nothing is loaded and the user is told how
+   many rows matched, so they can narrow it (memory-safe by design).
+   ============================================================ */
+const LARGE_LOAD_CAP_MOBILE = 200000, LARGE_LOAD_CAP_DESKTOP = 500000;
+function largeLoadCap(){
+  if(window.__largeCapOverride) return window.__largeCapOverride;
+  const mobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent||'');
+  return mobile ? LARGE_LOAD_CAP_MOBILE : LARGE_LOAD_CAP_DESKTOP;
+}
+function hasRowOnlyFilter(){ // Branch / Employee are not tracked by the summary
+  return ['Branch','Employee'].some(k=>{ const sel=state.filterSel[k]; return sel && sel.length && !isFullSelection(k, sel); });
+}
+function estimateRowsFromSummary(){
+  if(!state.summaryAgg || !state.summaryAgg.size) return state.knownTotalRowCount||0;
+  let n=0;
+  state.summaryAgg.forEach((e,key)=>{ if(summaryBucketPasses(key.split('|'), state.filterSel)) n += e.count; });
+  return n;
+}
+// Cursor scan with early stop: visit(chunk) returns true to stop.
+async function idbScanChunks(visit){
+  const db = await openDB();
+  return new Promise((res,rej)=>{
+    const tx = db.transaction('chunks','readonly');
+    const req = tx.objectStore('chunks').openCursor();
+    req.onsuccess = (e)=>{
+      const c = e.target.result;
+      if(!c) return;
+      let stop=false;
+      try{ stop = visit(c.value); }catch(err){ rej(err); try{ tx.abort(); }catch(_){} return; }
+      if(stop){ res('stopped'); try{ tx.abort(); }catch(_){} return; }
+      c.continue();
+    };
+    tx.oncomplete = ()=>res('done');
+    tx.onerror = e=>rej(dbErr(e,'Failed reading stored data'));
+  });
+}
+// Same predicate as applyRowFilters(), usable one row at a time.
+function buildRowMatcher(){
+  const yearSel = state.filterSel['Year'];
+  const monthSel = state.filterSel['Month'];
+  const empSel = state.filterSel['Employee'];
+  const empIsAll = isFullSelection('Employee', empSel);
+  const empCodes = (empSel && empSel.length && !empIsAll) ? new Set(empSel.map(employeeCodeFromOption)) : null;
+  const monthNames = ['','January','February','March','April','May','June','July','August','September','October','November','December'];
+  const colFilters = Object.entries(FILTER_COL_MAP)
+    .map(([key2, col])=> ({ col, sel: state.filterSel[key2], key2 }))
+    .filter(f=> f.sel && f.sel.length && !isFullSelection(f.key2, f.sel));
+  const needsDate = (yearSel && yearSel.length) || (monthSel && monthSel.length);
+  return function matches(r){
+    for(let i=0;i<colFilters.length;i++){
+      const f = colFilters[i]; const v = r[f.col];
+      if(!(f.sel.includes(String(v)) || f.sel.includes(v))) return false;
+    }
+    if(empCodes && !empCodes.has(String(r[COL.EMP]))) return false;
+    if(needsDate){
+      const d = new Date(r[COL.DATE]); if(isNaN(d)) return false;
+      if(yearSel && yearSel.length && !yearSel.includes(String(d.getFullYear()))) return false;
+      if(monthSel && monthSel.length && !monthSel.includes(monthNames[d.getMonth()+1])) return false;
+    }
+    return true;
+  };
+}
+async function loadFilteredRowsLarge(){
+  const cap = largeLoadCap();
+  const est = estimateRowsFromSummary();
+  state.largeInfo = { cap, est, loaded:0, blocked:false };
+  if(!hasRowOnlyFilter() && est > cap){ state.largeInfo.blocked = true; return []; }
+  if(!idbAvailable){ state.largeInfo.blocked = true; state.largeInfo.noStorage = true; return []; }
+  const matches = buildRowMatcher();
+  const out = []; let over = false, seen = 0;
+  const totalChunks = Math.max(1, Math.ceil((state.knownTotalRowCount||0)/5000));
+  const label = document.getElementById('phaseState');
+  await idbScanChunks(chunk=>{
+    const rows = (chunk && chunk.rows) || [];
+    for(let i=0;i<rows.length;i++){
+      if(matches(rows[i])){ out.push(rows[i]); if(out.length > cap){ over = true; return true; } }
+    }
+    seen++;
+    if(label && seen%10===0) label.textContent = 'Loading rows… '+Math.min(99, Math.round(seen/totalChunks*100))+'%';
+    return false;
+  });
+  if(over){ state.largeInfo.blocked = true; return []; }
+  state.largeInfo.loaded = out.length;
+  return out;
+}
+const LARGE_ROW_PAGES = new Set(['page-yearly','page-district-matrix','page-employee-monthly','page-employee-yearly']);
+function updateLargeModeBanner(){
+  const old = document.getElementById('largeModeBanner'); if(old) old.remove();
+  if(!state.largeDatasetMode) return;
+  const page = document.querySelector('.page.active'); if(!page) return;
+  const id = page.id||'';
+  const needsRows = LARGE_ROW_PAGES.has(id) || id.indexOf('page-risk')===0 ||
+    (id==='page-analysis' && currentAnalysisDim && !COL_TO_SUMMARY_DIM[currentAnalysisDim]);
+  if(!needsRows) return;
+  const info = state.largeInfo;
+  let cls='#fff7e6', bd='#f5c26b', txt;
+  if(info && info.loaded && state.active.length){
+    cls='#e8f8ef'; bd='#7bd1a0';
+    txt='✅ بڑا ڈیٹا (Summary Mode): فلٹر کی '+state.active.length.toLocaleString()+' rows لوڈ ہیں — یہ رپورٹ صرف انہی rows پر ہے۔';
+  } else if(info && info.blocked){
+    txt = info.noStorage
+      ? '⚠️ مستقل اسٹوریج بند ہے، اس لیے بڑے ڈیٹا کی rows دوبارہ لوڈ نہیں ہو سکتیں۔ فائل کو ہوسٹ شدہ لنک (https) سے کھولیں۔'
+      : '⚠️ فلٹر کے مطابق تقریباً '+info.est.toLocaleString()+' rows ہیں، حد '+info.cap.toLocaleString()+' ہے — District / Month / Department سے فلٹر مزید محدود کر کے Apply Filters دبائیں۔';
+  } else {
+    txt='ℹ️ بڑے ڈیٹا ('+(state.knownTotalRowCount||0).toLocaleString()+' rows) میں یہ رپورٹ فلٹر کے بغیر نہیں بنتی۔ اوپر Smart Filter Bar سے District / Month وغیرہ منتخب کر کے Apply Filters دبائیں۔';
+  }
+  const b = document.createElement('div'); b.id='largeModeBanner';
+  b.style.cssText='margin:10px 0;padding:10px 14px;border-radius:10px;font-size:13px;line-height:1.7;background:'+cls+';border:1px solid '+bd+';color:#333;direction:rtl;text-align:right;';
+  b.textContent = txt;
+  page.insertBefore(b, page.firstChild);
+}
+(function(){ // keep the banner correct on every navigation path
+  const _nav = navigateTo;
+  navigateTo = function(it){ const r=_nav.apply(this, arguments); try{ updateLargeModeBanner(); }catch(e){} return r; };
+})();
+
 document.getElementById('applyFiltersBtn').addEventListener('click', async ()=>{
-  state.active = await applyRowFilters(state.rows);
+  if(state.largeDatasetMode){
+    state.active = await loadFilteredRowsLarge();
+    dataGeneration++;
+  } else {
+    state.active = await applyRowFilters(state.rows);
+  }
   state.table.page = 1;
   refreshActivePage();
   schedulePrewarmRiskCache();
   const totalLabel = state.largeDatasetMode ? state.knownTotalRowCount.toLocaleString()+' (Summary Mode)' : state.rows.length.toLocaleString();
   document.getElementById('phaseState').textContent = state.active.length.toLocaleString()+' / '+totalLabel+' Rows (Filtered)';
-  toast('success','Filters Applied — فلٹرز لاگو ہو گئے', state.active.length.toLocaleString()+' rows matched');
+  if(state.largeDatasetMode && state.largeInfo && state.largeInfo.blocked){
+    toast('warning','Filter too broad — فلٹر بہت وسیع ہے', state.largeInfo.noStorage ? 'Storage unavailable' : ('≈'+state.largeInfo.est.toLocaleString()+' rows matched, limit '+state.largeInfo.cap.toLocaleString()+' — District / Month / Department سے محدود کریں'));
+  } else {
+    toast('success','Filters Applied — فلٹرز لاگو ہو گئے', state.active.length.toLocaleString()+' rows matched');
+  }
+  updateLargeModeBanner();
   idbSetMeta('lastFilterSel', state.filterSel);
 
   // REPORT MODE: if exactly one Analysis Mode metric is selected, switch matching
@@ -4955,6 +5089,7 @@ document.getElementById('filterBarReset').addEventListener('click', ()=>{
   state.filterSel = {};
   buildFilters(state.rows); // also restores any cascade-narrowed dropdown option lists
   state.active = state.rows;
+  state.largeInfo = null;
   state.table.page = 1;
   refreshActivePage();
   const totalLabel2 = (state.largeDatasetMode ? state.knownTotalRowCount : state.rows.length).toLocaleString() + (state.largeDatasetMode?' (Summary Mode)':'');
@@ -7688,9 +7823,14 @@ function schedulePrewarmRiskCache(){
 }
 function riskNoRowsHtml(){
   if(state.largeDatasetMode){
-    return '⚠️ ڈیٹا بہت بڑا ہے ('+(state.knownTotalRowCount||0).toLocaleString()+' rows) — Summary Mode میں Risk Monitor اور Employee/Branch رپورٹس دستیاب نہیں۔ Data → Import Data سے پرانی فائلیں Delete کر کے کل ڈیٹا کم کریں۔';
+    const i = state.largeInfo;
+    if(i && i.blocked) return i.noStorage
+      ? '⚠️ مستقل اسٹوریج بند ہے — بڑے ڈیٹا کی rows لوڈ نہیں ہو سکتیں، فائل https لنک سے کھولیں'
+      : '⚠️ فلٹر کے مطابق تقریباً '+i.est.toLocaleString()+' rows ہیں، حد '+i.cap.toLocaleString()+' ہے — District / Month / Department سے فلٹر محدود کر کے Apply Filters دبائیں';
+    return 'ℹ️ بڑا ڈیٹا ('+(state.knownTotalRowCount||0).toLocaleString()+' rows): Risk Monitor کے لیے اوپر Smart Filter Bar سے District / Month وغیرہ منتخب کر کے Apply Filters دبائیں';
   }
-  return '📁 ڈیٹا درآمد نہیں ہوا — پہلے Excel فائل Import کریں';
+  if(!state.rows.length) return '📁 ڈیٹا درآمد نہیں ہوا — پہلے Excel فائل Import کریں';
+  return 'فلٹر کے مطابق کوئی ڈیٹا نہیں';
 }
 function showRiskLoadingState(containerId){
   const el = document.getElementById(containerId);
@@ -7936,11 +8076,11 @@ function renderRiskSummaryCards(mod, ds){
 
 function renderRiskModulePage(mod){
   if(!document.getElementById('rmTableBody-'+mod)) return; // page not in DOM yet on first paint
-  if(!state.rows.length){
+  if(!getRiskBaseRows().length){
     const c0=document.getElementById('rmSummaryCards-'+mod);
     if(c0) c0.innerHTML='<div class="rm-scard" style="grid-column:1/-1;text-align:center;padding:22px;">'+riskNoRowsHtml()+'</div>';
     const tb0=document.getElementById('rmTableBody-'+mod);
-    if(tb0) tb0.innerHTML='<tr><td colspan="99" class="empty-state">'+(state.largeDatasetMode?'Summary Mode — row-level data not loaded':'No data imported')+'</td></tr>';
+    if(tb0) tb0.innerHTML='<tr><td colspan="99" class="empty-state">'+(state.largeDatasetMode?'Summary Mode — apply a narrower filter to load rows':'No data for current filters')+'</td></tr>';
     return;
   }
   if(!isRiskCacheWarm()){
@@ -8659,7 +8799,7 @@ function getRiskTrend(ds){
 }
 function renderRiskDashboardPage(){
   if(!document.getElementById('rdCards')) return;
-  if(!state.rows.length){
+  if(!getRiskBaseRows().length){
     document.getElementById('rdCards').innerHTML='<div class="rm-scard" style="grid-column:1/-1;text-align:center;padding:22px;">'+riskNoRowsHtml()+'</div>';
     return;
   }
